@@ -4538,6 +4538,70 @@ fn absorb_batch_claims<B: CommitBackend>(
 
 /// Prove the combined multi-point opening (see [`CombinedBatchOpen`]).
 /// `targets` are `(commitment, poly, blind, claims)` in canonical order.
+/// Round polynomial evals `(e0, e2)` for one instance of the interleaved
+/// combined open, via delayed reduction: accumulate the product sums
+/// `e0 = Σ f0·w0` and `e2 = Σ (2f1-f0)(2w1-w0)` UNREDUCED and Montgomery-
+/// reduce once per round instead of once per term (the BDDT round-0
+/// pattern — heaviest in the large early rounds). Reduction is a ring
+/// homomorphism so the result is identical to the per-term form. `e1` is
+/// recovered by the caller as `run - e0`. Interior sparsity (all-zero
+/// strided f-slots) is skipped as before.
+fn interleaved_round_evals<B: CommitBackend>(
+  fz: &[B::Scalar],
+  wz: &[B::Scalar],
+  h: usize,
+) -> (B::Scalar, B::Scalar) {
+  use crate::big_num::DelayedReduction;
+  let zero = <B::Scalar as DelayedReduction<B::Scalar>>::Accumulator::default;
+  let step = |acc: &mut (
+    <B::Scalar as DelayedReduction<B::Scalar>>::Accumulator,
+    <B::Scalar as DelayedReduction<B::Scalar>>::Accumulator,
+  ),
+              i: usize| {
+    let (f0, f1) = (fz[i], fz[i + h]);
+    let f0z = f0.is_zero_vartime();
+    if f0z && f1.is_zero_vartime() {
+      return;
+    }
+    let (w0, w1) = (wz[i], wz[i + h]);
+    if !f0z {
+      B::Scalar::unreduced_multiply_accumulate(&mut acc.0, &f0, &w0);
+    }
+    let a = f1 + f1 - f0;
+    let b = w1 + w1 - w0;
+    B::Scalar::unreduced_multiply_accumulate(&mut acc.1, &a, &b);
+  };
+  let (a0, a2) = if h >= 1 << 12 {
+    (0..h)
+      .into_par_iter()
+      .fold(
+        || (zero(), zero()),
+        |mut acc, i| {
+          step(&mut acc, i);
+          acc
+        },
+      )
+      .reduce(
+        || (zero(), zero()),
+        |mut x, y| {
+          x.0 += y.0;
+          x.1 += y.1;
+          x
+        },
+      )
+  } else {
+    let mut acc = (zero(), zero());
+    for i in 0..h {
+      step(&mut acc, i);
+    }
+    acc
+  };
+  (
+    <B::Scalar as DelayedReduction<B::Scalar>>::reduce(&a0),
+    <B::Scalar as DelayedReduction<B::Scalar>>::reduce(&a2),
+  )
+}
+
 fn prove_combined_batch_open<B: CommitBackend>(
   ck: &B::Ck,
   sub: &mut impl ByteTranscript,
@@ -4599,40 +4663,7 @@ fn prove_combined_batch_open<B: CommitBackend>(
       // Interior sparsity: skip zero-f terms (chunk-layout polynomials
       // have many strided zero slots — values narrower than their limb
       // budget, bit values, dropped regions).
-      let (e0, e2) = if h >= 1 << 12 {
-        (0..h)
-          .into_par_iter()
-          .map(|i| {
-            let (f0, f1) = (fs[j].Z[i], fs[j].Z[i + h]);
-            let f0z = f0.is_zero_vartime();
-            if f0z && f1.is_zero_vartime() {
-              return (B::Scalar::ZERO, B::Scalar::ZERO);
-            }
-            let (w0, w1) = (ws[j].Z[i], ws[j].Z[i + h]);
-            let t0 = if f0z { B::Scalar::ZERO } else { f0 * w0 };
-            (t0, (f1 + f1 - f0) * (w1 + w1 - w0))
-          })
-          .reduce(
-            || (B::Scalar::ZERO, B::Scalar::ZERO),
-            |a, b| (a.0 + b.0, a.1 + b.1),
-          )
-      } else {
-        let mut e0 = B::Scalar::ZERO;
-        let mut e2 = B::Scalar::ZERO;
-        for i in 0..h {
-          let (f0, f1) = (fs[j].Z[i], fs[j].Z[i + h]);
-          let f0z = f0.is_zero_vartime();
-          if f0z && f1.is_zero_vartime() {
-            continue;
-          }
-          let (w0, w1) = (ws[j].Z[i], ws[j].Z[i + h]);
-          if !f0z {
-            e0 += f0 * w0;
-          }
-          e2 += (f1 + f1 - f0) * (w1 + w1 - w0);
-        }
-        (e0, e2)
-      };
+      let (e0, e2) = interleaved_round_evals::<B>(&fs[j].Z, &ws[j].Z, h);
       let uni = UniPoly::from_evals(&[e0, run[j] - e0, e2])?;
       sub.absorb(b"cbo_p", &uni);
       staged.push((j, uni));
