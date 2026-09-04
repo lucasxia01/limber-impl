@@ -19,8 +19,24 @@ const BF_N_QUERIES: usize = 100;
 /// Public seed for the deterministic foldable-code diagonals.
 const BF_SEED: &[u8] = b"limber-basefold-v1";
 
-fn code_for<F: crate::traits::PrimeFieldExt>(log_k: usize) -> FoldableCode<F> {
-  FoldableCode::new(log_k, BF_INV_RATE, BF_SEED)
+/// Deterministic foldable code for `2^log_k` messages, built once per
+/// `(field, log_k)` and cached (the build inverts `O(2^log_k)` diagonals).
+fn code_for<F: crate::traits::PrimeFieldExt>(log_k: usize) -> &'static FoldableCode<F> {
+  use std::any::{Any, TypeId};
+  use std::collections::HashMap;
+  use std::sync::{Mutex, OnceLock};
+  static CACHE: OnceLock<Mutex<HashMap<(TypeId, usize), &'static (dyn Any + Send + Sync)>>> =
+    OnceLock::new();
+  let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+  let mut guard = cache.lock().expect("basefold code cache poisoned");
+  let key = (TypeId::of::<F>(), log_k);
+  if let Some(p) = guard.get(&key) {
+    return p.downcast_ref::<FoldableCode<F>>().expect("cache type");
+  }
+  let code: &'static FoldableCode<F> =
+    Box::leak(Box::new(FoldableCode::new(log_k, BF_INV_RATE, BF_SEED)));
+  guard.insert(key, code as &'static (dyn Any + Send + Sync));
+  code
 }
 
 fn verr(msg: &str) -> SpartanError {
@@ -105,7 +121,7 @@ where
       }
       let code = code_for::<Self::Scalar>(log_k);
       sub.absorb_bytes(b"bf-comm", t.comm);
-      let proof = prove_eval(&code, t.data, t.poly, &t.point, t.eval, BF_N_QUERIES, sub)?;
+      let proof = prove_eval(code, t.data, t.poly, &t.point, t.eval, BF_N_QUERIES, sub)?;
       proofs.push(proof);
     }
     Ok(proofs)
@@ -124,7 +140,7 @@ where
       let log_k = point.len();
       let code = code_for::<Self::Scalar>(log_k);
       sub.absorb_bytes(b"bf-comm", *comm);
-      if !verify_eval(&code, comm, point, *eval, proof, BF_N_QUERIES, sub)? {
+      if !verify_eval(code, comm, point, *eval, proof, BF_N_QUERIES, sub)? {
         return Err(verr("evaluation proof rejected"));
       }
     }
@@ -173,7 +189,9 @@ mod tests {
       let poly = rand(1 << d, 1);
       let z = rand(d, 2);
       let y = build_eq_eval(&poly, &z);
+      let tc = std::time::Instant::now();
       let (comm, data) = B::commit(&(), &poly, &(), false).unwrap();
+      let commit_ms = tc.elapsed().as_secs_f64() * 1e3;
       let mut tp: Tr = Keccak256Transcript::new_with_params(b"bf", ());
       let targets = [OpenTarget {
         comm: &comm,
@@ -183,11 +201,13 @@ mod tests {
         point: z.clone(),
         eval: y,
       }];
+      let to = std::time::Instant::now();
       let arg = B::open_targets(&(), &targets, &mut tp).unwrap();
+      let open_ms = to.elapsed().as_secs_f64() * 1e3;
       let bytes = bincode::serialize(&arg).unwrap();
       println!(
-        "BaseFold proof  n=2^{d}  rate=1/{BF_INV_RATE}  {BF_N_QUERIES} queries: \
-         {} bytes ({:.1} KB)",
+        "BaseFold n=2^{d} rate=1/{BF_INV_RATE} {BF_N_QUERIES}q: commit {commit_ms:.1} ms, \
+         open {open_ms:.1} ms, proof {} bytes ({:.1} KB)",
         bytes.len(),
         bytes.len() as f64 / 1024.0
       );

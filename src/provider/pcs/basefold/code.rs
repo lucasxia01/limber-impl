@@ -26,6 +26,26 @@ fn inv<F: Field>(x: F) -> F {
   Option::<F>::from(x.invert()).expect("inverse of a nonzero code element")
 }
 
+/// Montgomery batch inversion: invert all of `xs` with ONE field inversion
+/// plus `O(n)` multiplications (vs `n` inversions). All entries must be
+/// nonzero.
+fn batch_invert<F: Field>(xs: &[F]) -> Vec<F> {
+  let n = xs.len();
+  let mut prefix = vec![F::ONE; n];
+  let mut acc = F::ONE;
+  for (i, &x) in xs.iter().enumerate() {
+    prefix[i] = acc;
+    acc *= x;
+  }
+  let mut inv_acc = inv(acc);
+  let mut out = vec![F::ZERO; n];
+  for i in (0..n).rev() {
+    out[i] = inv_acc * prefix[i];
+    inv_acc *= xs[i];
+  }
+  out
+}
+
 /// Next nonzero field element from the deterministic stream.
 fn nz<F: PrimeFieldExt>(r: &mut impl XofReader) -> F {
   loop {
@@ -65,10 +85,17 @@ impl<F: PrimeFieldExt> FoldableCode<F> {
     let diag: Vec<Vec<F>> = (0..log_k)
       .map(|i| (0..c << i).map(|_| nz::<F>(&mut r)).collect())
       .collect();
-    let diag_inv: Vec<Vec<F>> = diag
-      .iter()
-      .map(|row| row.iter().map(|t| inv(*t)).collect())
-      .collect();
+    // Batch-invert all diagonals at once (was O(n) inversions — the actual
+    // hotspot; a length-2^21 code inverts ~2^21 elements per build).
+    let lens: Vec<usize> = diag.iter().map(|r| r.len()).collect();
+    let flat: Vec<F> = diag.iter().flatten().copied().collect();
+    let flat_inv = batch_invert(&flat);
+    let mut diag_inv: Vec<Vec<F>> = Vec::with_capacity(diag.len());
+    let mut off = 0;
+    for len in lens {
+      diag_inv.push(flat_inv[off..off + len].to_vec());
+      off += len;
+    }
     let inv2 = inv(F::ONE + F::ONE);
     Self {
       log_k,
@@ -177,6 +204,44 @@ mod tests {
   use crate::provider::pt256::t256;
 
   type F = t256::Scalar;
+
+  #[test]
+  #[ignore = "measurement"]
+  fn commit_breakdown() {
+    use super::super::query::commit_layer;
+    let log_k = 18usize;
+    let code = FoldableCode::<F>::new(log_k, 8, b"m");
+    let msg: Vec<F> = rand_vec(1 << log_k, 1);
+    let t = std::time::Instant::now();
+    let cw = code.encode(&msg);
+    let enc_ms = t.elapsed().as_secs_f64() * 1e3;
+    let n = cw.len();
+    let t2 = std::time::Instant::now();
+    let _c0 = commit_layer(cw);
+    let merkle_ms = t2.elapsed().as_secs_f64() * 1e3;
+    println!("2^{log_k} rate1/8 codeword={n}: encode {enc_ms:.0} ms, merkle {merkle_ms:.0} ms");
+  }
+
+  #[test]
+  #[ignore = "measurement"]
+  fn encode_cost() {
+    for log_k in [16usize, 18] {
+      for rate in [2usize, 4, 8] {
+        let code = FoldableCode::<F>::new(log_k, rate, b"m");
+        let msg: Vec<F> = rand_vec(1 << log_k, 1);
+        // warm
+        let _ = code.encode(&msg);
+        let t = std::time::Instant::now();
+        let cw = code.encode(&msg);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        println!(
+          "encode log_k={log_k} rate=1/{rate}: codeword={} ({:.0} Mmul est) -> {ms:.1} ms",
+          cw.len(),
+          (log_k as f64) * (cw.len() as f64) / 2.0 / 1e6
+        );
+      }
+    }
+  }
 
   /// Defining invariant: folding an encoded message equals encoding the
   /// folded message (`fold∘encode == encode∘fold_msg`). This is the
