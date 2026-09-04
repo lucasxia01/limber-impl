@@ -5,14 +5,18 @@
 //! pins the evaluation to the specific point `z`. After `d` rounds the folded
 //! codeword is `base(ẑ(α))` and the sumcheck's final claim must equal
 //! `eq(z,α)·ẑ(α)`, tying the recovered value back to the claimed `y`.
+//!
+//! Fiat–Shamir runs over the crate `ByteTranscript`, so this slots directly
+//! behind `CommitBackend`. The caller absorbs the commitment before opening;
+//! this routine absorbs the opening's own `(z, y)` and every fold root.
 
 use super::super::brakedown::merkle::{Hash, MerkleTree, hash_leaf, verify_path};
 use super::code::FoldableCode;
 use super::query::{CommittedLayer, QueryOpening, commit_layer, leaf_bytes};
+use crate::errors::SpartanError;
 use crate::traits::PrimeFieldExt;
+use crate::traits::transcript::ByteTranscript;
 use ff::{Field, PrimeField};
-use sha3::Shake256;
-use sha3::digest::{ExtendableOutput, Update, XofReader};
 
 /// A full multilinear-evaluation proof.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -72,36 +76,36 @@ fn eq_at_fold<F: Field>(z: &[F], alphas: &[F]) -> F {
     .fold(F::ONE, |acc, (j, &a)| acc * eqf(z[d - 1 - j], a))
 }
 
-fn absorb(x: &mut Shake256, label: &[u8], bytes: &[u8]) {
-  x.update(&(label.len() as u64).to_le_bytes());
-  x.update(label);
-  x.update(&(bytes.len() as u64).to_le_bytes());
-  x.update(bytes);
+fn absorb_f<T: ByteTranscript, F: PrimeField>(sub: &mut T, label: &'static [u8], f: &F) {
+  sub.absorb_bytes(label, f.to_repr().as_ref());
 }
 
-fn absorb_f<F: PrimeField>(x: &mut Shake256, label: &[u8], f: &F) {
-  absorb(x, label, f.to_repr().as_ref());
+fn squeeze_scalar<T: ByteTranscript, F: PrimeFieldExt>(
+  sub: &mut T,
+  label: &'static [u8],
+) -> Result<F, SpartanError> {
+  Ok(F::from_uniform(&sub.squeeze_bytes(label)?))
 }
 
-fn squeeze_scalar<F: PrimeFieldExt>(x: &Shake256) -> F {
-  let mut r = x.clone().finalize_xof();
-  let mut b = [0u8; 64];
-  r.read(&mut b);
-  F::from_uniform(&b)
+fn squeeze_index<T: ByteTranscript>(
+  sub: &mut T,
+  label: &'static [u8],
+  bound: usize,
+) -> Result<usize, SpartanError> {
+  let b = sub.squeeze_bytes(label)?;
+  let mut e = [0u8; 8];
+  e.copy_from_slice(&b[..8]);
+  Ok((u64::from_le_bytes(e) % bound as u64) as usize)
 }
 
-fn squeeze_index(x: &Shake256, ctr: u64, bound: usize) -> usize {
-  let mut h = x.clone();
-  h.update(b"idx");
-  h.update(&ctr.to_le_bytes());
-  let mut r = h.finalize_xof();
-  let mut b = [0u8; 8];
-  r.read(&mut b);
-  (u64::from_le_bytes(b) % bound as u64) as usize
+fn root_of<F: PrimeField>(word: &[F]) -> Hash {
+  let leaves: Vec<Hash> = word.iter().map(|x| hash_leaf(&leaf_bytes(x))).collect();
+  MerkleTree::from_leaves(leaves).root()
 }
 
 /// Prove `ẑ(z) = y` for the committed evaluations `m_evals` (`c0 =
-/// commit(encode(m_evals))`).
+/// commit(encode(m_evals))`). The caller must have absorbed the commitment
+/// into `sub` beforehand.
 pub fn prove_eval<F: PrimeFieldExt>(
   code: &FoldableCode<F>,
   c0: &CommittedLayer<F>,
@@ -109,17 +113,16 @@ pub fn prove_eval<F: PrimeFieldExt>(
   z: &[F],
   y: F,
   n_queries: usize,
-) -> EvalProof<F> {
+  sub: &mut impl ByteTranscript,
+) -> Result<EvalProof<F>, SpartanError> {
   let d = code.log_k();
   assert_eq!(m_evals.len(), 1usize << d);
   assert_eq!(z.len(), d);
 
-  let mut fs = Shake256::default();
-  absorb(&mut fs, b"bf-c0", &c0.root);
   for zi in z {
-    absorb_f(&mut fs, b"z", zi);
+    absorb_f(sub, b"bf-z", zi);
   }
-  absorb_f(&mut fs, b"y", &y);
+  absorb_f(sub, b"bf-y", &y);
 
   let mut m = m_evals.to_vec();
   let mut eq = build_eq(z);
@@ -137,17 +140,17 @@ pub fn prove_eval<F: PrimeFieldExt>(
       let m2 = m[half + j].double() - m[j];
       h2 += e2 * m2;
     }
-    absorb_f(&mut fs, b"h", &h0);
-    absorb_f(&mut fs, b"h", &h1);
-    absorb_f(&mut fs, b"h", &h2);
-    let alpha: F = squeeze_scalar(&fs);
+    absorb_f(sub, b"bf-h", &h0);
+    absorb_f(sub, b"bf-h", &h1);
+    absorb_f(sub, b"bf-h", &h2);
+    let alpha: F = squeeze_scalar(sub, b"bf-a")?;
     sumcheck.push([h0, h1, h2]);
 
     m = fold_eval(&m, alpha);
     eq = fold_eval(&eq, alpha);
     cur = code.fold(&cur, alpha, d - i);
     let committed = commit_layer(cur.clone());
-    absorb(&mut fs, b"cf", &committed.root);
+    sub.absorb_bytes(b"bf-cf", &committed.root);
     folded.push(committed);
   }
 
@@ -171,8 +174,8 @@ pub fn prove_eval<F: PrimeFieldExt>(
 
   let n0 = code.codeword_len();
   let mut queries = Vec::with_capacity(n_queries);
-  for q in 0..n_queries {
-    let mut s = squeeze_index(&fs, q as u64, n0);
+  for _ in 0..n_queries {
+    let mut s = squeeze_index(sub, b"bf-idx", n0)?;
     let mut opened = Vec::with_capacity(d);
     let mut len = n0;
     for li in 0..d {
@@ -188,15 +191,16 @@ pub fn prove_eval<F: PrimeFieldExt>(
     queries.push(QueryOpening { layers: opened });
   }
 
-  EvalProof {
+  Ok(EvalProof {
     sumcheck,
     layer_roots,
     base,
     queries,
-  }
+  })
 }
 
 /// Verify a `prove_eval` proof of `ẑ(z) = y` against commitment `c0_root`.
+/// `Ok(true)` = accept, `Ok(false)` = reject, `Err` = transcript failure.
 pub fn verify_eval<F: PrimeFieldExt>(
   code: &FoldableCode<F>,
   c0_root: &Hash,
@@ -204,70 +208,58 @@ pub fn verify_eval<F: PrimeFieldExt>(
   y: F,
   proof: &EvalProof<F>,
   n_queries: usize,
-) -> bool {
+  sub: &mut impl ByteTranscript,
+) -> Result<bool, SpartanError> {
   let d = code.log_k();
   if proof.sumcheck.len() != d
     || proof.layer_roots.len() != d
     || proof.queries.len() != n_queries
     || z.len() != d
   {
-    return false;
+    return Ok(false);
   }
   // Base must be a genuine base codeword, matching its committed root.
   let Some(v) = code.base_value(&proof.base) else {
-    return false;
+    return Ok(false);
   };
-  let base_root = {
-    let leaves: Vec<Hash> = proof
-      .base
-      .iter()
-      .map(|x| hash_leaf(&leaf_bytes(x)))
-      .collect();
-    MerkleTree::from_leaves(leaves).root()
-  };
-  if base_root != proof.layer_roots[d - 1] {
-    return false;
+  if root_of(&proof.base) != proof.layer_roots[d - 1] {
+    return Ok(false);
   }
 
-  let mut fs = Shake256::default();
-  absorb(&mut fs, b"bf-c0", c0_root);
   for zi in z {
-    absorb_f(&mut fs, b"z", zi);
+    absorb_f(sub, b"bf-z", zi);
   }
-  absorb_f(&mut fs, b"y", &y);
+  absorb_f(sub, b"bf-y", &y);
 
   let mut claim = y;
   let mut alphas: Vec<F> = Vec::with_capacity(d);
   for i in 0..d {
     let [h0, h1, h2] = proof.sumcheck[i];
     if h0 + h1 != claim {
-      return false;
+      return Ok(false);
     }
-    absorb_f(&mut fs, b"h", &h0);
-    absorb_f(&mut fs, b"h", &h1);
-    absorb_f(&mut fs, b"h", &h2);
-    let alpha: F = squeeze_scalar(&fs);
-    absorb(&mut fs, b"cf", &proof.layer_roots[i]);
+    absorb_f(sub, b"bf-h", &h0);
+    absorb_f(sub, b"bf-h", &h1);
+    absorb_f(sub, b"bf-h", &h2);
+    let alpha: F = squeeze_scalar(sub, b"bf-a")?;
+    sub.absorb_bytes(b"bf-cf", &proof.layer_roots[i]);
     claim = quad_eval(&[h0, h1, h2], alpha);
     alphas.push(alpha);
   }
 
-  // Final sumcheck claim ties the fold-recovered value v = ẑ(α) to y.
   if claim != eq_at_fold(z, &alphas) * v {
-    return false;
+    return Ok(false);
   }
 
-  // Proximity: the codeword fold chain (with the sumcheck challenges) is
-  // consistent at random spot-checks.
   let roots: Vec<&Hash> = std::iter::once(c0_root)
     .chain(proof.layer_roots.iter())
     .collect();
   let n0 = code.codeword_len();
-  for (q, query) in proof.queries.iter().enumerate() {
+  for query in &proof.queries {
     if query.layers.len() != d {
-      return false;
+      return Ok(false);
     }
-    let mut s = squeeze_index(&fs, q as u64, n0);
+    let mut s = squeeze_index(sub, b"bf-idx", n0)?;
     let mut chained: Option<F> = None;
     let mut len = n0;
     for (li, (vlo, plo, vhi, phi)) in query.layers.iter().enumerate() {
@@ -277,32 +269,36 @@ pub fn verify_eval<F: PrimeFieldExt>(
       if !verify_path(roots[li], &leaf_bytes(vlo), lo, plo)
         || !verify_path(roots[li], &leaf_bytes(vhi), hi, phi)
       {
-        return false;
+        return Ok(false);
       }
       let entry_at_s = if s < half { *vlo } else { *vhi };
       if let Some(exp) = chained
         && exp != entry_at_s
       {
-        return false;
+        return Ok(false);
       }
       chained = Some(code.fold_pair(*vlo, *vhi, alphas[li], d - li, lo));
       s = lo;
       len = half;
     }
     if chained != Some(proof.base[s]) {
-      return false;
+      return Ok(false);
     }
   }
-  true
+  Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
   use super::super::code::rand_vec;
   use super::*;
+  use crate::provider::T256HyraxEngine;
+  use crate::provider::keccak::Keccak256Transcript;
   use crate::provider::pt256::t256;
+  use crate::traits::transcript::TranscriptEngineTrait;
 
   type F = t256::Scalar;
+  type Tr = Keccak256Transcript<T256HyraxEngine>;
 
   fn mle_eval(m: &[F], z: &[F]) -> F {
     build_eq(z).iter().zip(m).map(|(e, mi)| *e * *mi).sum()
@@ -319,32 +315,26 @@ mod tests {
     let z: Vec<F> = rand_vec(d, 8);
     let y = mle_eval(&m, &z);
 
-    let proof = prove_eval(&code, &c0, &m, &z, y, nq);
-    assert!(
-      verify_eval(&code, &c0.root, &z, y, &proof, nq),
-      "honest open verifies"
-    );
+    // Prover transcript: absorb the commitment (as the backend would), open.
+    let mut tp: Tr = Keccak256Transcript::new_with_params(b"bf-test", ());
+    tp.absorb_bytes(b"comm", &c0.root);
+    let proof = prove_eval(&code, &c0, &m, &z, y, nq, &mut tp).unwrap();
 
-    // Wrong claimed value -> reject.
-    assert!(
-      !verify_eval(&code, &c0.root, &z, y + F::ONE, &proof, nq),
-      "wrong y rejected"
-    );
+    let verify = |y: F, proof: &EvalProof<F>| {
+      let mut tv: Tr = Keccak256Transcript::new_with_params(b"bf-test", ());
+      tv.absorb_bytes(b"comm", &c0.root);
+      verify_eval(&code, &c0.root, &z, y, proof, nq, &mut tv).unwrap()
+    };
 
-    // Tamper a sumcheck message -> reject.
+    assert!(verify(y, &proof), "honest open verifies");
+    assert!(!verify(y + F::ONE, &proof), "wrong y rejected");
+
     let mut bad = proof.clone();
     bad.sumcheck[0][0] += F::ONE;
-    assert!(
-      !verify_eval(&code, &c0.root, &z, y, &bad, nq),
-      "tampered sumcheck rejected"
-    );
+    assert!(!verify(y, &bad), "tampered sumcheck rejected");
 
-    // Tamper a query opening -> reject.
     let mut bad2 = proof.clone();
     bad2.queries[0].layers[0].0 += F::ONE;
-    assert!(
-      !verify_eval(&code, &c0.root, &z, y, &bad2, nq),
-      "tampered opening rejected"
-    );
+    assert!(!verify(y, &bad2), "tampered opening rejected");
   }
 }

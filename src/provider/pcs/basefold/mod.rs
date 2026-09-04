@@ -6,16 +6,19 @@
 //! BaseFold's random foldable code does not). Reuses the Brakedown Merkle
 //! tree and deterministic sampling.
 //!
-//! Status: the cryptographic CORE is complete and validated —
+//! Status: the cryptographic core AND the `CommitBackend` wiring are complete
+//! and validated (round-trip + tamper tests + the code's defining invariants):
+//!
 //! - `code`: field-agnostic foldable code (encode/fold, evaluation basis)
 //! - `query`: FRI-style proximity IOP (Merkle commit + fold/consistency)
-//! - `open`: full multilinear opening (eq-sumcheck interleaved with the fold)
-//! All by round-trip + tamper tests + the code's defining invariants.
+//! - `open`: full multilinear opening (eq-sumcheck interleaved with the fold),
+//!   over the crate `ByteTranscript`
+//! - `backend`: `CommitBackend` impl (`BfBackend`) — commit / open / verify
 //!
-//! Next (production wiring): a `CommitBackend` impl over the crate
-//! `ByteTranscript` with multi-target batching + blinds, then Mod-PCS
-//! integration (route the chunk-oracle / range-check opening through here).
+//! Next: multi-target batching (one shared fold), then Mod-PCS integration
+//! (route the chunk-oracle / range-check opening through this backend).
 
+pub mod backend;
 pub mod code;
 pub mod open;
 pub mod query;
