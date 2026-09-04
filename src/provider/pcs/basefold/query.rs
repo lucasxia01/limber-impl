@@ -21,7 +21,7 @@ use ff::PrimeField;
 use sha3::Shake256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 
-fn leaf_bytes<F: PrimeField>(x: &F) -> Vec<u8> {
+pub(crate) fn leaf_bytes<F: PrimeField>(x: &F) -> Vec<u8> {
   x.to_repr().as_ref().to_vec()
 }
 
@@ -29,8 +29,8 @@ fn leaf_bytes<F: PrimeField>(x: &F) -> Vec<u8> {
 pub struct CommittedLayer<F> {
   /// Merkle root over the per-entry leaves.
   pub root: Hash,
-  tree: MerkleTree,
-  word: Vec<F>,
+  pub(crate) tree: MerkleTree,
+  pub(crate) word: Vec<F>,
 }
 
 /// Commit one codeword layer (Merkle over per-entry leaves).

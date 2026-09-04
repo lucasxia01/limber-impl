@@ -126,7 +126,7 @@ impl<F: PrimeFieldExt> FoldableCode<F> {
   pub fn fold_pair(&self, w_lo: F, w_hi: F, alpha: F, level: usize, j: usize) -> F {
     let l = (w_lo + w_hi) * self.inv2;
     let r = (w_lo - w_hi) * self.inv2 * self.diag_inv[level - 1][j];
-    l + alpha * r
+    (F::ONE - alpha) * l + alpha * r
   }
 
   /// If `base` is a valid base codeword `v · base_gen`, return `v`; else
@@ -157,7 +157,8 @@ impl<F: PrimeFieldExt> FoldableCode<F> {
         let l = (w0[j] + w1[j]) * self.inv2;
         // r = (w0 − w1) / (2 t) = (w0 − w1) · inv2 · t⁻¹
         let r = (w0[j] - w1[j]) * self.inv2 * tinv[j];
-        l + alpha * r
+        // Evaluation-basis fold (fixing a multilinear variable to α):
+        (F::ONE - alpha) * l + alpha * r
       })
       .collect()
   }
@@ -192,7 +193,9 @@ mod tests {
       let lhs = code.fold(&code.encode(&msg), alpha, log_k);
 
       let half = 1usize << (log_k - 1);
-      let msg_folded: Vec<F> = (0..half).map(|j| msg[j] + alpha * msg[half + j]).collect();
+      let msg_folded: Vec<F> = (0..half)
+        .map(|j| (F::ONE - alpha) * msg[j] + alpha * msg[half + j])
+        .collect();
       let rhs = sub.encode(&msg_folded);
 
       assert_eq!(lhs, rhs, "foldability at log_k={log_k}");
@@ -222,7 +225,9 @@ mod tests {
     let mut m = msg.clone();
     for &alpha in &point {
       let half = m.len() / 2;
-      m = (0..half).map(|j| m[j] + alpha * m[half + j]).collect();
+      m = (0..half)
+        .map(|j| (F::ONE - alpha) * m[j] + alpha * m[half + j])
+        .collect();
     }
     assert_eq!(m.len(), 1);
     let eval = m[0];
