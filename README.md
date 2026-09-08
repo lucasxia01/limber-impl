@@ -89,6 +89,33 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --bench <name>
 | `multiswap_modp` | MultiSwap (RSA-accumulator verification circuit, [OWWB20](https://eprint.iacr.org/2019/1494)). `BDPCS=1` runs the Brakedown instantiation instead of Hyrax |
 | `logup_gkr` | LogUp-GKR range proof in isolation |
 
+### Quick start: w-bit integer multiplication
+
+To prove a chain of 32- or 64-bit integer multiplications, use the
+`int_mult` example. The circuit is one wired multiplication chain
+`c_i = a_i · b_i mod 2^w` with `a_{i+1} = c_i` (i.e. it proves
+`c = a_0 · Π b_i mod 2^w` for random w-bit operands) — per-gate
+wraparound multiplication with real dataflow, which is free in the
+Mod-R1CS matrices. `--log-gates L` packs `2^L − 1` gates into `2^L`
+constraint rows and `2^(L+1)` witness variables with no padding waste.
+Width and chain length are the only inputs; `log T = log T_f = w`
+(single limb) and `(log P, s)` are derived automatically for λ = 128
+and printed on every run:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" RAYON_NUM_THREADS=1 \
+  cargo run --release --example int_mult -- --bits 64 --log-gates 16
+```
+
+It prints the derived parameters, per-phase times (setup, witness
+generation, commit+prove, verify), and the proof size. Witness generation
+is timed separately so the commit+prove line is comparable to systems
+that exclude it from prover time. `DUMP=<path>` writes the serialized
+eval argument so its compressed size can be measured (`zstd -19`);
+Limber proofs compress by only ~2% — they are elliptic-curve points and
+field elements, already information-dense.
+
+
 ## Results
 
 All numbers are single-threaded (`RAYON_NUM_THREADS=1`) on a MacBook (Apple M4 Pro, 24 GB RAM, 14 cores); all baselines were re-run on the same machine.
