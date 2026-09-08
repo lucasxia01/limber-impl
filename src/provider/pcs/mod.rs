@@ -10,7 +10,6 @@
 pub mod ipa;
 
 // implementations of polynomial commitment schemes
-pub mod basefold;
 pub mod brakedown;
 pub(crate) mod commit_backend;
 pub mod hyrax_pc;
