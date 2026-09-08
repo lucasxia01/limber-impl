@@ -99,7 +99,7 @@ fn squeeze_index<T: ByteTranscript>(
 }
 
 fn root_of<F: PrimeField>(word: &[F]) -> Hash {
-  let leaves: Vec<Hash> = word.iter().map(|x| hash_leaf(&leaf_bytes(x))).collect();
+  let leaves: Vec<Hash> = word.iter().map(|x| hash_leaf(x.to_repr().as_ref())).collect();
   MerkleTree::from_leaves(leaves).root()
 }
 

@@ -35,7 +35,7 @@ pub struct CommittedLayer<F> {
 
 /// Commit one codeword layer (Merkle over per-entry leaves).
 pub fn commit_layer<F: PrimeFieldExt>(word: Vec<F>) -> CommittedLayer<F> {
-  let leaves: Vec<Hash> = word.iter().map(|x| hash_leaf(&leaf_bytes(x))).collect();
+  let leaves: Vec<Hash> = word.iter().map(|x| hash_leaf(x.to_repr().as_ref())).collect();
   let tree = MerkleTree::from_leaves(leaves);
   CommittedLayer {
     root: tree.root(),
