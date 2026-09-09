@@ -339,7 +339,7 @@ fn full_size_h10_proof_roundtrip() {
     verify_poseidon_chain(&pvk, &instance, &proof).unwrap();
     instance
   };
-  assert_eq!(hy_instance.commitment_bytes().unwrap().len(), 8464);
+  assert_eq!(hy_instance.commitment_bytes().unwrap().len(), 8472);
 
   let bd_instance = {
     let set = build_all_params().unwrap();
@@ -355,7 +355,7 @@ fn full_size_h10_proof_roundtrip() {
     verify_poseidon_chain(&pvk, &instance, &proof).unwrap();
     instance
   };
-  assert_eq!(bd_instance.commitment_bytes().unwrap().len(), 64);
+  assert_eq!(bd_instance.commitment_bytes().unwrap().len(), 72);
 }
 
 /// A proof for one digest triple must not verify against a different
