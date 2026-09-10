@@ -14,7 +14,7 @@ use limber::{
   errors::SpartanError,
   imod_r1cs_modp::IntModR1CSWitnessModp,
   imod_spartan_modp::IntModSpartanModpSNARK,
-  poseidon_bench::{DEFAULT_BD_K, DEFAULT_HYRAX_K},
+  poseidon_bench::{BenchBackend, default_k},
   poseidon2::{
     FIELD_ORDER, Field, PoseidonVerifierKey, build_all_params, build_inputs, build_params,
     build_shape, check_canonical_io, compute_advice, expected_chain, permute, validate_advice,
@@ -28,10 +28,15 @@ use num_traits::Zero;
 type Hy = T256DynPrimeEngine;
 type Bd = T256DynPrimeBdEngine;
 
-/// The persisted per-backend IntEval `k` defaults, so proofs are tested
-/// under the same parameters the benchmark resolves.
-const HYRAX_K: usize = DEFAULT_HYRAX_K;
-const BD_K: usize = DEFAULT_BD_K;
+/// The persisted per-backend IntEval `k` defaults (the compiled tuned
+/// default, else the v9 default), so proofs are tested under the same
+/// parameters the benchmark resolves.
+fn hyrax_k() -> usize {
+  default_k(BenchBackend::Hyrax)
+}
+fn bd_k() -> usize {
+  default_k(BenchBackend::Brakedown)
+}
 
 fn kat_fixture() -> serde_json::Value {
   let path =
@@ -207,7 +212,7 @@ fn satisfiability_and_tampered_witness() {
   let (shape, layout) = build_shape::<Hy>(&set, 1).unwrap();
   let messages = build_inputs(1).unwrap();
   let (w, q, digests) = compute_advice(&set, &layout, &messages).unwrap();
-  let ie_params = derive_params(layout.log_n(), HYRAX_K);
+  let ie_params = derive_params(layout.log_n(), hyrax_k());
   let (pk, _vk) =
     IntModSpartanModpSNARK::<Hy>::setup_with_params(shape.clone(), ie_params).unwrap();
   let (witness, instance) =
@@ -278,7 +283,7 @@ macro_rules! roundtrip_h1 {
 
 #[test]
 fn roundtrip_h1_combined_hyrax() {
-  let instance = roundtrip_h1!(Hy, HYRAX_K);
+  let instance = roundtrip_h1!(Hy, hyrax_k());
   // H = 1: n = 2^11, f_chunk = 2^15, 16 rows per commitment. `comm_w`
   // is now a per-segment Vec (one width segment here), so its 8-byte
   // outer length prefix is added on top of the two commitments:
@@ -288,7 +293,7 @@ fn roundtrip_h1_combined_hyrax() {
 
 #[test]
 fn roundtrip_h1_combined_brakedown() {
-  let instance = roundtrip_h1!(Bd, BD_K);
+  let instance = roundtrip_h1!(Bd, bd_k());
   // Brakedown: two 32-byte Merkle roots + the 8-byte outer length
   // prefix of the per-segment `comm_w` Vec = 72.
   assert_eq!(instance.commitment_bytes().unwrap().len(), 72);
@@ -330,7 +335,7 @@ fn full_size_h10_proof_roundtrip() {
     let (shape, layout) = build_shape::<Hy>(&set, 10).unwrap();
     let messages = build_inputs(10).unwrap();
     let (w, q, digests) = compute_advice(&set, &layout, &messages).unwrap();
-    let ie = derive_params(layout.log_n(), HYRAX_K);
+    let ie = derive_params(layout.log_n(), hyrax_k());
     let (pk, vk) = IntModSpartanModpSNARK::<Hy>::setup_with_params(shape.clone(), ie).unwrap();
     let pvk = PoseidonVerifierKey::new(vk, &set, &layout).unwrap();
     let (witness, instance) =
@@ -346,7 +351,7 @@ fn full_size_h10_proof_roundtrip() {
     let (shape, layout) = build_shape::<Bd>(&set, 10).unwrap();
     let messages = build_inputs(10).unwrap();
     let (w, q, digests) = compute_advice(&set, &layout, &messages).unwrap();
-    let ie = derive_params(layout.log_n(), BD_K);
+    let ie = derive_params(layout.log_n(), bd_k());
     let (pk, vk) = IntModSpartanModpSNARK::<Bd>::setup_with_params(shape.clone(), ie).unwrap();
     let pvk = PoseidonVerifierKey::new(vk, &set, &layout).unwrap();
     let (witness, instance) =
@@ -369,7 +374,7 @@ fn wrong_canonical_digest_is_rejected() {
   let (shape, layout) = build_shape::<Hy>(&set, 1).unwrap();
   let messages = build_inputs(1).unwrap();
   let (w, q, digests) = compute_advice(&set, &layout, &messages).unwrap();
-  let ie = derive_params(layout.log_n(), HYRAX_K);
+  let ie = derive_params(layout.log_n(), hyrax_k());
   let (pk, vk) = IntModSpartanModpSNARK::<Hy>::setup_with_params(shape.clone(), ie).unwrap();
   let pvk = PoseidonVerifierKey::new(vk, &set, &layout).unwrap();
   let (witness, instance) =

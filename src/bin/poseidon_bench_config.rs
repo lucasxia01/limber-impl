@@ -1,9 +1,11 @@
-//! Immutable run-config emitter for the Poseidon2 benchmark runner.
+//! Immutable run-config emitter for the Poseidon2 Spartan benchmark runner.
 //!
-//! Resolves the benchmark flags through the shared crate-side parser
-//! (`limber::poseidon_bench::RunConfig::parse`) — the shell runner never
-//! interprets flags itself — then gathers the source/toolchain/host
-//! fields and emits one canonical sorted-key JSON document on stdout.
+//! Resolves the Spartan suite's request through the shared crate-side
+//! parser (`limber::poseidon2_spartan::SpartanRunRequest`) — the shell
+//! runner never interprets flags itself — then gathers the
+//! source/toolchain/host fields and emits one canonical sorted-key JSON
+//! document on stdout. The ModP suite no longer uses this helper: its
+//! run configuration is built by `scripts/poseidon_runner.py` (plan v10).
 //!
 //! `--check <path>` regenerates the document in memory and byte-compares
 //! it against the file, exiting nonzero on drift (used immediately before
@@ -24,7 +26,7 @@
 )]
 #![allow(non_snake_case)]
 
-use limber::poseidon_bench::{RunConfig, canonical_json_bytes};
+use limber::poseidon_bench::canonical_json_bytes;
 use limber::poseidon2::build_all_params;
 use limber::poseidon2_spartan::{
   SpartanRunRequest, build_circuit, hard_safety_precheck, resolve_spartan_run,
@@ -215,7 +217,7 @@ fn main() -> ExitCode {
   let env_map: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
 
   // Optional leading `--suite <modp|spartan>`; the default remains the
-  // ModP suite.
+  // ModP suite name (which now only reports where that suite moved).
   let suite = if args.first().map(String::as_str) == Some("--suite") {
     if args.len() < 2 {
       eprintln!("poseidon_bench_config: --suite requires a value (modp|spartan)");
@@ -229,13 +231,16 @@ fn main() -> ExitCode {
   };
 
   let (protocol, allow_dirty) = match suite.as_str() {
-    "modp" => match RunConfig::parse(&env_map) {
-      Ok(c) => (c.protocol_json(), c.allow_dirty),
-      Err(e) => {
-        eprintln!("poseidon_bench_config: {e}");
-        return ExitCode::FAILURE;
-      }
-    },
+    "modp" => {
+      // The ModP suite moved to the v10 cross-system runner
+      // (`scripts/poseidon_runner.py`), which builds the immutable run
+      // configuration itself; this helper now serves the Spartan suite only.
+      eprintln!(
+        "poseidon_bench_config: the modp suite is driven by scripts/poseidon_runner.py; \
+         use --suite spartan"
+      );
+      return ExitCode::FAILURE;
+    }
     "spartan" => {
       // Two-stage lifecycle (spartan plan §6): pure request parse, stage-1
       // hard-safety precheck, then ONE actual shape synthesis frozen into

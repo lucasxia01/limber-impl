@@ -8,6 +8,10 @@ readme = "README.md"
 repository = "https://github.com/j-cqy/limber-impl"
 license-file = "LICENSE"
 keywords = ["zkSNARKs", "cryptography", "proofs"]
+# Every bench target is listed explicitly below: `benches/` also holds the
+# shared `poseidon_modp_support.rs` module (included via `#[path]` by the
+# `poseidon_modp` bench and its integration test), which is not a target.
+autobenches = false
 
 [dependencies]
 bellpepper-core = "0.4.0"
@@ -56,7 +60,15 @@ getrandom = { version = "0.2.0", default-features = false, features = ["js"] }
 
 [dev-dependencies]
 rand = "0.8.4"
-criterion = "0.5"
+# Pinned by the cross-system benchmark contract (Zinc plan v10 §9): the
+# Criterion output-tree grammar the runner parses is that of exactly 0.7.0
+# with no plots/HTML/rayon features.
+criterion = { version = "=0.7.0", default-features = false, features = ["cargo_bench_support"] }
+# Deterministic benchmark coins: `ChaCha20Rng::from_seed` of the pinned
+# `rand_chacha` (rand_core 0.6, the crate's RNG trait generation).
+rand_chacha = "=0.3.1"
+# The Criterion ID grammar test of the benchmark contract.
+regex = "1"
 hex = "0.4.3"
 cfg-if = "1.0.0"
 sha2 = "0.10.7"
@@ -93,6 +105,7 @@ harness = false
 [[bench]]
 name = "poseidon_modp"
 harness = false
+test = false
 
 [[bench]]
 name = "poseidon_spartan"
@@ -101,6 +114,18 @@ harness = false
 [profile.release]
 debug = 1
 lto = "fat"
+
+# The cross-system benchmark profile (Zinc plan v10 §9): byte-identical to
+# Zinc's block; the runner rejects any deviation.
+[profile.bench]
+opt-level = 3
+debug = false
+strip = "none"
+debug-assertions = false
+overflow-checks = false
+lto = "fat"
+codegen-units = 1
+incremental = false
 
 # Profiling build: same optimization level as release, but with full debug
 # symbols and thin LTO so the flamegraph keeps readable frame boundaries

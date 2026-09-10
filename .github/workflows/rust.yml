@@ -51,7 +51,7 @@ jobs:
         with:
           # cache the wasm target, too
           cache-targets: "true"
-      # Library-only: the poseidon_bench_config helper binary is
+      # Library-only: the poseidon_spartan_preflight helper binary is
       # intentionally host-only (git/toolchain probing); the WASM job
       # continues testing the library surface it is meant to cover.
       - name: Wasm build

@@ -1,72 +1,83 @@
-//! Shared benchmark-run configuration for the Poseidon2 bench: the pure
-//! environment-flag parser, the pinned registration orders, and the
-//! canonical protocol-JSON serialization.
+//! Crate-side support for the Poseidon2 cross-system benchmark harness
+//! (`benches/poseidon_modp.rs`; Zinc plan v10 §9, limber contract §§1, 4,
+//! 5): the compiled identifiers, the pinned IntEval bounds and the TUNE-1
+//! candidate order, the persisted default `k` (from the generated
+//! `poseidon_tuned_defaults` module, falling back to the v9 default), the
+//! deterministic benchmark-coins seed derivation, the canonical `H = 10`
+//! circuit dimensions, and the pure environment helpers the
+//! classic-Spartan suite's own run-configuration parser still shares.
 //!
-//! Both `benches/poseidon_modp.rs` and the `poseidon_bench_config` helper
-//! binary call [`RunConfig::parse`], so the shell runner never
-//! independently interprets benchmark flags or backend defaults. The
-//! parser is pure: it reads only the map it is given, never the process
-//! environment, so its complete conflict table is unit-testable.
+//! The v9 environment-driven `RunConfig` (the `BDPCS`/`KSWEEP`/`PSIZE`/
+//! `HASHES`/`IMOD_K`/`BDK`/`POSEIDON_*` knobs) and the `POSEIDON_RUN_DIR`
+//! handshake are gone from the ModP benchmark: every input of the v10
+//! bench comes from its argv forms and the runner-written config files
+//! (`scripts/NOTES-for-rust.md`). The handshake constants below remain
+//! only for the classic-Spartan suite (`benches/poseidon_spartan.rs`).
 
-use crate::{errors::SpartanError, provider::pcs::integer_modpcs::IntEvalParams};
-use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use crate::{errors::SpartanError, poseidon_tuned_defaults, poseidon2};
+use std::{
+  collections::BTreeMap,
+  ffi::{OsStr, OsString},
+};
+
+pub use crate::{
+  poseidon2::ids::{BENCHMARK_COINS_DOMAIN, BENCHMARK_COINS_FRAMING, BENCHMARK_COINS_ID, K_ORDER},
+  prime_sampler::{LIMBER_PRIME_SAMPLER_ID, LIMBER_PROTOCOL_WIRE_ID, LIMBER_TRANSCRIPT_ID},
+};
 
 /// `log_2(T_f)` for the Poseidon2 workload: committed values are
 /// canonical residues below the ~256-bit target moduli.
 pub const POSEIDON_LOG_T_F: usize = 256;
 /// Limb bound (bits) for the IntEval range checks.
 pub const POSEIDON_LOG_T: usize = 64;
-/// Persisted default IntEval `k` for the Hyrax backend on the combined
-/// mixed-modulus circuit (log_n = 14). Selected by the 2026-09-02
-/// combined-circuit tuning `KSWEEP` (Apple M2, `RAYON_NUM_THREADS=1`,
-/// `target-cpu=native`): combined median 785 ms at `k = 9`, tie band
-/// {9, 11}, winner = smallest in band. Work-item-15 agreement from a
-/// clean revision is still required before publication.
-pub const DEFAULT_HYRAX_K: usize = 9;
-/// Persisted default IntEval `k` for the Brakedown backend on the
-/// combined mixed-modulus circuit. Same sweep: combined median 644 ms at
-/// the tie band {9, 10, 11}, winner = smallest in band.
-pub const DEFAULT_BD_K: usize = 9;
-/// Default chain length PER FIELD (the combined circuit contains `3H`).
-pub const DEFAULT_HASHES: usize = 10;
-/// Per-field chain-length cap without `POSEIDON_ALLOW_LARGE=1`.
-pub const MAX_HASHES: usize = 256;
+/// The pinned workload: compressions per field (`3H = 30` in the combined
+/// circuit).
+pub const CANONICAL_HASHES_PER_FIELD: usize = 10;
+/// The persisted v9 default IntEval `k` for both backends on the combined
+/// mixed-modulus circuit (2026-09-02 combined-circuit tuning sweep, Apple
+/// M2, `RAYON_NUM_THREADS=1`: tie band `{9, 11}` (Hyrax) / `{9, 10, 11}`
+/// (Brakedown), winner = smallest in band). Used only while the generated
+/// tuned-defaults module carries no epoch.
+pub const V9_DEFAULT_K: usize = 9;
+/// Inclusive candidate range of `k` (the tuning protocol's `k_range`).
+pub const K_RANGE: (usize, usize) = (7, 13);
 
-/// Pinned `KSWEEP` candidate registration order: one combined case per
-/// `k`; `FIELD_ORDER` below is the internal block/IO order, not a
-/// registration dimension.
-pub const K_ORDER: [usize; 7] = [10, 7, 12, 9, 13, 8, 11];
 /// The circuit's semantic field-block/public-IO order (layout metadata;
 /// benchmark groups have no field dimension). Must match
 /// `poseidon2::FIELD_ORDER` — a unit test binds the two.
 pub const FIELD_ORDER: [&str; 3] = ["bn254", "bls12_381", "secp256k1"];
-/// Literal normal-mode group order (`advice` is registered only by the
-/// default Hyrax normal run).
-pub const GROUP_ORDER: [&str; 6] = [
+
+/// The comparable groups (aligned cross-system boundaries), in literal
+/// order.
+pub const PRIMARY_GROUPS: [&str; 2] = ["prove_e2e", "verify_core"];
+/// The diagnostic groups of the diagnostic child, in literal registration
+/// order (`advice` is Hyrax-only: it is backend-independent and only the
+/// Hyrax process registers it).
+pub const DIAGNOSTIC_GROUPS: [&str; 4] = [
   "setup",
   "advice",
   "commit_witness",
   "prove_after_input_commit",
-  "prove_e2e",
-  "verify",
 ];
+/// Diagnostic groups only the Hyrax process registers.
+pub const HYRAX_ONLY_DIAGNOSTICS: [&str; 1] = ["advice"];
+/// The backend names (the metadata `variants`), in literal order.
+pub const BACKEND_NAMES: [&str; 2] = ["hyrax", "brakedown"];
 
-/// Runner-handshake variable: absolute run directory (Criterion writes to
-/// `<run-dir>/criterion/`; sidecars land beside it).
+/// Runner-handshake variable of the classic-Spartan suite: absolute run
+/// directory. Not read by the ModP benchmark.
 pub const ENV_RUN_DIR: &str = "POSEIDON_RUN_DIR";
-/// Runner-handshake variable: absolute path of the immutable
-/// `run-config.json`.
+/// Runner-handshake variable of the classic-Spartan suite: absolute path
+/// of the immutable `run-config.json`. Not read by the ModP benchmark.
 pub const ENV_CONFIG_PATH: &str = "POSEIDON_CONFIG_PATH";
-/// Runner-handshake variable: full SHA-256 (lowercase hex) of the
-/// config's exact bytes.
+/// Runner-handshake variable of the classic-Spartan suite: full SHA-256
+/// (lowercase hex) of the config's exact bytes. Not read by the ModP
+/// benchmark.
 pub const ENV_CONFIG_SHA256: &str = "POSEIDON_CONFIG_SHA256";
 
 /// The seven repository knobs that silently change Brakedown layout or
-/// prover work. A canonical run requires all seven unset;
-/// `POSEIDON_ALLOW_KNOBS=1` permits a clearly labelled nonstandard
-/// configuration whose raw values and effective interpretations enter
-/// the config hash.
+/// prover work. The v10 ModP benchmark requires all seven absent (fatal
+/// otherwise); the classic-Spartan suite still parses them.
 pub const HIDDEN_KNOBS: [&str; 7] = [
   "BDDIRECT",
   "BDSPEC",
@@ -77,90 +88,158 @@ pub const HIDDEN_KNOBS: [&str; 7] = [
   "RUST_LOG",
 ];
 
-/// Benchmark mode, resolved from `KSWEEP`/`PSIZE`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BenchMode {
-  /// The ordinary Criterion groups.
-  Normal,
-  /// Only the §6 `prove_e2e` sweep groups at fixed `H = 10`, then exit.
-  KSweep,
-  /// The four-line proof-size blocks for all fields, then exit.
-  ProofSize,
-}
+/// The analytical sumcheck-remainder formula of the proof-size record:
+/// cubic outer rounds (3 coefficients each), quadratic inner rounds (2
+/// coefficients each, `log_vars + 1` rounds), plus 6 claimed evaluations,
+/// at 16 bytes per two-limb runtime-prime scalar. Analytical payload, no
+/// framing.
+pub const SUMCHECK_REMAINDER_FORMULA: &str = "16 * (3 * log_cons + 2 * (log_vars + 1) + 6)";
 
-impl BenchMode {
-  /// Stable lowercase name for JSON/IDs.
-  pub fn name(&self) -> &'static str {
-    match self {
-      BenchMode::Normal => "normal",
-      BenchMode::KSweep => "ksweep",
-      BenchMode::ProofSize => "proof_size",
-    }
-  }
-}
-
-/// Commitment backend, resolved from `BDPCS`.
+/// Commitment backend of one benchmark process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BenchBackend {
-  /// Hyrax (curve) Mod-PCS — the default.
+  /// Hyrax (curve) Mod-PCS: hiding commitments, prover coins.
   Hyrax,
-  /// Brakedown (hash) Mod-PCS.
+  /// Brakedown (hash) Mod-PCS: non-hiding, no prover coins.
   Brakedown,
 }
 
 impl BenchBackend {
+  /// Both backends in `BACKEND_NAMES` order.
+  pub const ALL: [BenchBackend; 2] = [BenchBackend::Hyrax, BenchBackend::Brakedown];
+
   /// Stable lowercase name for JSON/IDs.
-  pub fn name(&self) -> &'static str {
+  pub fn name(self) -> &'static str {
     match self {
       BenchBackend::Hyrax => "hyrax",
       BenchBackend::Brakedown => "brakedown",
     }
   }
+
+  /// The benchmark-coins backend tag (the tuning protocol's
+  /// `backend_tags`: hyrax 0, brakedown 1).
+  pub fn tag(self) -> u8 {
+    match self {
+      BenchBackend::Hyrax => 0,
+      BenchBackend::Brakedown => 1,
+    }
+  }
+
+  /// Whether this backend keeps the Brakedown retained cache (and thus
+  /// the deterministic empty-cache reset policy before timed samples).
+  pub fn uses_retained_cache(self) -> bool {
+    matches!(self, BenchBackend::Brakedown)
+  }
+
+  /// Parse a backend name.
+  pub fn parse(name: &str) -> Option<Self> {
+    Self::ALL.into_iter().find(|b| b.name() == name)
+  }
+
+  /// The diagnostic groups this backend's diagnostic child registers, in
+  /// literal order.
+  pub fn diagnostic_groups(self) -> Vec<&'static str> {
+    DIAGNOSTIC_GROUPS
+      .iter()
+      .copied()
+      .filter(|g| self == BenchBackend::Hyrax || !HYRAX_ONLY_DIAGNOSTICS.contains(g))
+      .collect()
+  }
 }
 
-/// Raw and effective state of one permitted hidden knob.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KnobState {
-  /// The raw environment value (present knobs only).
-  pub raw: String,
-  /// The effective interpretation the backend code will apply.
-  pub effective: String,
+/// Whether `k` is a TUNE-1 candidate (`K_RANGE`, equivalently a member of
+/// `K_ORDER`).
+pub fn is_candidate_k(k: usize) -> bool {
+  (K_RANGE.0..=K_RANGE.1).contains(&k)
 }
 
-/// A fully resolved benchmark-run configuration.
-#[derive(Clone, Debug)]
-pub struct RunConfig {
-  /// Resolved mode.
-  pub mode: BenchMode,
-  /// Resolved backend.
-  pub backend: BenchBackend,
-  /// Resolved chain length `H` PER FIELD.
-  pub hashes: usize,
-  /// Total compressions in the combined circuit: `3H`.
-  pub total_hashes: usize,
-  /// Resolved IntEval `k` (default-or-override; ignored in `KSweep`).
-  pub k: usize,
-  /// Whether `k` came from an explicit override (`IMOD_K`/`BDK`).
-  pub k_overridden: bool,
-  /// `POSEIDON_ALLOW_LARGE=1`.
-  pub allow_large: bool,
-  /// `POSEIDON_ALLOW_KNOBS=1`.
-  pub allow_knobs: bool,
-  /// `POSEIDON_ALLOW_DIRTY=1`.
-  pub allow_dirty: bool,
-  /// Present hidden knobs with raw and effective values (empty for a
-  /// canonical run).
-  pub knobs: BTreeMap<String, KnobState>,
-  /// Real (unpadded) combined rows for the resolved `H`: `1299H`.
-  pub real_rows: usize,
-  /// Real (unpadded) combined columns for the resolved `H`: `1302H − 3`.
-  pub real_cols: usize,
-  /// Padded constraint rows.
+/// Zero-based position of `k` in the pinned candidate order `K_ORDER`
+/// (the benchmark-coins `candidate_index`).
+pub fn candidate_index(k: usize) -> Option<u32> {
+  K_ORDER
+    .iter()
+    .position(|c| *c == k)
+    .map(|i| u32::try_from(i).expect("seven candidates"))
+}
+
+/// The compiled tuned default of `backend`, `(k, tuning_id)`, from the
+/// generated `poseidon_tuned_defaults` module; `None` before the first
+/// tuning epoch.
+pub fn tuned_default(backend: BenchBackend) -> Option<(usize, &'static str)> {
+  poseidon_tuned_defaults::TUNED_DEFAULTS
+    .iter()
+    .find(|(name, ..)| *name == backend.name())
+    .map(|(_, k, tuning_id)| (*k, *tuning_id))
+}
+
+/// The default `k` of `backend`: the compiled tuned default, else the
+/// persisted v9 default [`V9_DEFAULT_K`].
+pub fn default_k(backend: BenchBackend) -> usize {
+  tuned_default(backend).map_or(V9_DEFAULT_K, |(k, _)| k)
+}
+
+/// The padded combined-circuit dimensions of `H` compressions per field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Dimensions {
+  /// Padded constraint rows (`2^log_cons`).
   pub num_cons: usize,
-  /// Padded witness columns.
+  /// Padded witness columns (`2^log_vars`).
   pub num_vars: usize,
-  /// `log₂(max(num_cons, num_vars))`.
+  /// `log_2(num_cons)`.
+  pub log_cons: usize,
+  /// `log_2(num_vars)`.
+  pub log_vars: usize,
+  /// `log_2(max(num_cons, num_vars))`: the IntEval `log_n`.
   pub log_n: usize,
+}
+
+/// The padded dimensions of the combined mixed-modulus circuit for
+/// `hashes_per_field` compressions per field (checked arithmetic, no
+/// shape synthesis). Independent of `k`.
+pub fn poseidon_bench_dims(hashes_per_field: usize) -> Result<Dimensions, SpartanError> {
+  let (_, _, _, _, num_cons, num_vars, log_n) = poseidon2::checked_dims(hashes_per_field)?;
+  Ok(Dimensions {
+    num_cons,
+    num_vars,
+    log_cons: num_cons.ilog2() as usize,
+    log_vars: num_vars.ilog2() as usize,
+    log_n,
+  })
+}
+
+/// `dimensions_by_k` of the compiled metadata: the padded dimensions for
+/// every candidate `k` in `K_RANGE` at `hashes_per_field` (the canonical
+/// `H = 10` in the metadata). The dimensions do not depend on `k`; the
+/// map form is the contract's shape.
+pub fn dimensions_by_k(
+  hashes_per_field: usize,
+) -> Result<BTreeMap<usize, Dimensions>, SpartanError> {
+  let dims = poseidon_bench_dims(hashes_per_field)?;
+  Ok((K_RANGE.0..=K_RANGE.1).map(|k| (k, dims)).collect())
+}
+
+/// The deterministic benchmark-coins seed (`BENCHMARK_COINS_ID`): the
+/// unkeyed 32-byte BLAKE3 hash of
+/// `BENCHMARK_COINS_DOMAIN || backend_u8 || candidate_index_le32 || instance_le32`
+/// (`BENCHMARK_COINS_FRAMING`). The benchmark seeds `ChaCha20Rng`
+/// (`rand_chacha` 0.3.1) from it inside every timed prover sample.
+pub fn benchmark_coins_seed(
+  backend: BenchBackend,
+  candidate_index: u32,
+  instance: u32,
+) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(BENCHMARK_COINS_DOMAIN);
+  hasher.update(&[backend.tag()]);
+  hasher.update(&candidate_index.to_le_bytes());
+  hasher.update(&instance.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
+/// The analytical sumcheck-remainder byte count of the proof-size record
+/// ([`SUMCHECK_REMAINDER_FORMULA`]).
+pub fn analytical_sumcheck_remainder_bytes(log_cons: usize, log_vars: usize) -> usize {
+  16 * (3 * log_cons + 2 * (log_vars + 1) + 6)
 }
 
 pub(crate) fn cfg_err(reason: impl Into<String>) -> SpartanError {
@@ -218,278 +297,10 @@ pub(crate) fn is_present(env: &BTreeMap<OsString, OsString>, key: &str) -> bool 
   env.contains_key(OsStr::new(key))
 }
 
-impl RunConfig {
-  /// Parse a benchmark-run configuration from an environment map. Pure:
-  /// consults nothing but `env`. Implements the complete flag grammar and
-  /// conflict table of plan §12; conflicts are errors, never silently
-  /// ignored.
-  pub fn parse(env: &BTreeMap<OsString, OsString>) -> Result<Self, SpartanError> {
-    // Boolean flags first (strict 0/1).
-    let bdpcs = parse_bool(env, "BDPCS")?;
-    let ksweep = parse_bool(env, "KSWEEP")?;
-    let psize = parse_bool(env, "PSIZE")?;
-    let allow_large = parse_bool(env, "POSEIDON_ALLOW_LARGE")?;
-    let allow_knobs = parse_bool(env, "POSEIDON_ALLOW_KNOBS")?;
-    let allow_dirty = parse_bool(env, "POSEIDON_ALLOW_DIRTY")?;
-
-    let backend = if bdpcs {
-      BenchBackend::Brakedown
-    } else {
-      BenchBackend::Hyrax
-    };
-
-    // Mode resolution and mode-level conflicts. In KSweep the PRESENCE of
-    // these variables is an error, even when a value equals a default.
-    let mode = if ksweep {
-      for key in ["PSIZE", "HASHES", "IMOD_K", "BDK", "POSEIDON_ALLOW_LARGE"] {
-        if is_present(env, key) {
-          return Err(cfg_err(format!("KSWEEP=1 rejects the presence of {key}")));
-        }
-      }
-      BenchMode::KSweep
-    } else if psize {
-      BenchMode::ProofSize
-    } else {
-      BenchMode::Normal
-    };
-
-    // Backend-specific k overrides.
-    if is_present(env, "IMOD_K") && is_present(env, "BDK") {
-      return Err(cfg_err("setting both IMOD_K and BDK is always an error"));
-    }
-    match backend {
-      BenchBackend::Hyrax => {
-        if is_present(env, "BDK") {
-          return Err(cfg_err("the Hyrax backend rejects BDK (use IMOD_K)"));
-        }
-      }
-      BenchBackend::Brakedown => {
-        if is_present(env, "IMOD_K") {
-          return Err(cfg_err("the Brakedown backend rejects IMOD_K (use BDK)"));
-        }
-      }
-    }
-
-    // Chain length PER FIELD: default 10, 1..=256, POSEIDON_ALLOW_LARGE
-    // lifts the cap (still <= u32::MAX via the shared per-field
-    // chain-count validator; combined-dimension arithmetic additionally
-    // checks 3H below).
-    let hashes = parse_usize(env, "HASHES")?.unwrap_or(DEFAULT_HASHES);
-    if hashes == 0 {
-      return Err(cfg_err("HASHES must be at least 1"));
-    }
-    if hashes > MAX_HASHES && !allow_large {
-      return Err(cfg_err(format!(
-        "HASHES = {hashes} exceeds {MAX_HASHES} per field; set POSEIDON_ALLOW_LARGE=1 to lift the cap"
-      )));
-    }
-    if hashes > u32::MAX as usize {
-      return Err(cfg_err("HASHES exceeds u32::MAX"));
-    }
-
-    // Combined-circuit dimensions for the resolved per-field H (checked
-    // arithmetic, including every multiplication by three).
-    let total_hashes = hashes
-      .checked_mul(3)
-      .ok_or_else(|| cfg_err("3H overflows usize"))?;
-    let real_rows = 433usize
-      .checked_mul(hashes)
-      .and_then(|r| r.checked_mul(3))
-      .ok_or_else(|| cfg_err("row arithmetic overflow"))?;
-    let real_cols = 434usize
-      .checked_mul(hashes)
-      .and_then(|c| c.checked_sub(1))
-      .and_then(|c| c.checked_mul(3))
-      .ok_or_else(|| cfg_err("column arithmetic overflow"))?;
-    let num_cons = real_rows
-      .checked_next_power_of_two()
-      .ok_or_else(|| cfg_err("padded row overflow"))?;
-    let num_vars = real_cols
-      .checked_next_power_of_two()
-      .ok_or_else(|| cfg_err("padded column overflow"))?;
-    let log_n = num_cons.max(num_vars).ilog2() as usize;
-
-    // k resolution: override in 7..=13 whose derived params validate, or
-    // the persisted per-backend default.
-    let override_key = match backend {
-      BenchBackend::Hyrax => "IMOD_K",
-      BenchBackend::Brakedown => "BDK",
-    };
-    let k_override = parse_usize(env, override_key)?;
-    if let Some(k) = k_override {
-      if !(7..=13).contains(&k) {
-        return Err(cfg_err(format!("{override_key} = {k} is outside 7..=13")));
-      }
-      IntEvalParams::derive(POSEIDON_LOG_T_F, POSEIDON_LOG_T, k, log_n).map_err(|e| {
-        cfg_err(format!(
-          "{override_key} = {k} fails IntEval derivation: {e}"
-        ))
-      })?;
-    }
-    let k = k_override.unwrap_or(match backend {
-      BenchBackend::Hyrax => DEFAULT_HYRAX_K,
-      BenchBackend::Brakedown => DEFAULT_BD_K,
-    });
-
-    // Hidden knobs: presence is an error without POSEIDON_ALLOW_KNOBS=1
-    // (which waives only this prohibition, never syntax, range, mode, or
-    // backend-specific conflicts). With the override, validate before any
-    // backend code inherits a silent default or an out-of-range panic.
-    let mut knobs = BTreeMap::new();
-    for &knob in HIDDEN_KNOBS.iter() {
-      if !is_present(env, knob) {
-        continue;
-      }
-      if !allow_knobs {
-        return Err(cfg_err(format!(
-          "{knob} is set; a canonical run requires all seven repo knobs unset \
-           (POSEIDON_ALLOW_KNOBS=1 permits a labelled nonstandard run)"
-        )));
-      }
-      let raw = get_unicode(env, knob)?.expect("presence checked");
-      let effective = match knob {
-        "BDDIRECT" => {
-          let v = raw
-            .parse::<usize>()
-            .map_err(|_| cfg_err(format!("BDDIRECT must be a usize, got {raw:?}")))?;
-          format!("direct-ship threshold {v}")
-        }
-        "BDSPEC" => {
-          let v = raw
-            .parse::<usize>()
-            .ok()
-            .filter(|v| *v <= 5)
-            .ok_or_else(|| cfg_err(format!("BDSPEC must be an integer in 0..=5, got {raw:?}")))?;
-          format!("code spec {v}")
-        }
-        "BDROWLEN" => {
-          let v = raw
-            .parse::<usize>()
-            .ok()
-            .filter(|v| *v > 0)
-            .ok_or_else(|| cfg_err(format!("BDROWLEN must be a positive usize, got {raw:?}")))?;
-          // Per-input effective row length is `.min(n)`; report it for
-          // the run's w/q input chunk length, not just the request.
-          let f_chunk = num_vars
-            .max(num_cons)
-            .checked_mul(4 * 4)
-            .ok_or_else(|| cfg_err("f_chunk arithmetic overflow"))?;
-          format!(
-            "requested {v}, effective {} for input length {f_chunk}",
-            v.min(f_chunk)
-          )
-        }
-        // Presence-sensitive booleans: the string "0" is still present.
-        "BDSPLIT" => "present (enabled regardless of value)".to_string(),
-        "CHAIN_BITS" => "present (enabled regardless of value)".to_string(),
-        // Inverted sense: any value other than "0" enables the skip.
-        "GKRSKIP" => {
-          if raw == "0" {
-            "skip DISABLED (inverted sense: 0 disables)".to_string()
-          } else {
-            "skip enabled".to_string()
-          }
-        }
-        "RUST_LOG" => {
-          tracing_subscriber::EnvFilter::builder()
-            .parse(&raw)
-            .map_err(|e| cfg_err(format!("RUST_LOG rejected by EnvFilter: {e}")))?;
-          format!("EnvFilter {raw:?}")
-        }
-        _ => unreachable!("knob list is fixed"),
-      };
-      knobs.insert(knob.to_string(), KnobState { raw, effective });
-    }
-
-    Ok(Self {
-      mode,
-      backend,
-      hashes,
-      total_hashes,
-      k,
-      k_overridden: k_override.is_some(),
-      allow_large,
-      allow_knobs,
-      allow_dirty,
-      knobs,
-      real_rows,
-      real_cols,
-      num_cons,
-      num_vars,
-      log_n,
-    })
-  }
-
-  /// The canonical protocol subsection: every immutable, result-affecting
-  /// resolved input. `serde_json`'s default `Map` is BTree-backed, so
-  /// serialization is key-sorted and deterministic.
-  pub fn protocol_json(&self) -> serde_json::Value {
-    // Shared semantic-workload digest (spartan plan §6/§11): both suites
-    // embed the same §3 workload descriptor hash so the cross-system
-    // publication gate can compare workloads exactly, not just by name.
-    let workload_digest: String = {
-      let set = crate::poseidon2::build_all_params().expect("workload params validate");
-      crate::poseidon2_spartan::snark::workload_digest(&set)
-        .expect("workload digest")
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-    };
-    let mut knobs = serde_json::Map::new();
-    for (name, state) in &self.knobs {
-      knobs.insert(
-        name.clone(),
-        serde_json::json!({ "raw": state.raw, "effective": state.effective }),
-      );
-    }
-    serde_json::json!({
-      "workload": "limber-poseidon2-v1",
-      "workload_digest": workload_digest,
-      "circuit": "mixed3",
-      "mode": self.mode.name(),
-      "backend": self.backend.name(),
-      "hashes_per_field": self.hashes,
-      "total_hashes": self.total_hashes,
-      "num_io": 3,
-      "field_blocks": FIELD_ORDER.to_vec(),
-      "k": self.k,
-      "k_overridden": self.k_overridden,
-      "k_defaults": { "hyrax": DEFAULT_HYRAX_K, "brakedown": DEFAULT_BD_K },
-      "log_t_f": POSEIDON_LOG_T_F,
-      "log_t": POSEIDON_LOG_T,
-      "dims": {
-        "real_rows": self.real_rows,
-        "real_cols": self.real_cols,
-        "num_cons": self.num_cons,
-        "num_vars": self.num_vars,
-        "log_n": self.log_n,
-      },
-      "k_order": K_ORDER.to_vec(),
-      "field_order": FIELD_ORDER.to_vec(),
-      "group_order": GROUP_ORDER.to_vec(),
-      "allow_large": self.allow_large,
-      "allow_knobs": self.allow_knobs,
-      "allow_dirty": self.allow_dirty,
-      "knobs": serde_json::Value::Object(knobs),
-      "criterion": {
-        "sample_size": 10,
-        "warm_up_time_s": 1,
-        "measurement_time_s": 20,
-      },
-      "brakedown_cache_policy":
-        "layout-warm steady state; empty retained cache before every measured commit/prove sample",
-    })
-  }
-
-  /// Canonical bytes of the protocol subsection (pretty, sorted keys,
-  /// trailing newline).
-  pub fn protocol_canonical_bytes(&self) -> Vec<u8> {
-    canonical_json_bytes(&self.protocol_json())
-  }
-}
-
-/// Canonical JSON bytes: two-space pretty-printing over BTree-backed maps
-/// (sorted keys) plus one trailing newline.
+/// Canonical JSON bytes of the classic-Spartan suite's sidecars: two-space
+/// pretty-printing over BTree-backed maps (sorted keys) plus one trailing
+/// newline. (The v10 ModP benchmark writes compact canonical JSON of its
+/// own; see `benches/poseidon_modp_support.rs`.)
 pub fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
   let mut bytes =
     serde_json::to_vec_pretty(value).expect("serde_json::Value serialization cannot fail");
@@ -498,8 +309,8 @@ pub fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
 }
 
 /// Extract and canonicalize the `protocol` subsection of a full
-/// run-config JSON document (the benchmark byte-compares this against its
-/// own re-parse of the environment).
+/// run-config JSON document of the classic-Spartan suite (its benchmark
+/// byte-compares this against its own re-parse of the environment).
 pub fn protocol_bytes_from_full_config(full: &str) -> Result<Vec<u8>, SpartanError> {
   let doc: serde_json::Value = serde_json::from_str(full)
     .map_err(|e| cfg_err(format!("run-config is not valid JSON: {e}")))?;
@@ -524,39 +335,17 @@ mod tests {
   fn k_order_is_a_permutation_of_7_to_13() {
     let mut sorted = K_ORDER.to_vec();
     sorted.sort_unstable();
-    assert_eq!(sorted, (7..=13).collect::<Vec<_>>());
-  }
-
-  #[test]
-  fn defaults_resolve_cleanly() {
-    let cfg = RunConfig::parse(&env(&[])).unwrap();
-    assert_eq!(cfg.mode, BenchMode::Normal);
-    assert_eq!(cfg.backend, BenchBackend::Hyrax);
-    assert_eq!(cfg.hashes, 10);
-    assert_eq!(cfg.total_hashes, 30);
-    assert_eq!(cfg.k, DEFAULT_HYRAX_K);
-    assert!(!cfg.k_overridden);
-    // Combined-circuit dimensions: 1299H rows, 1302H − 3 columns, one
-    // 2^14 × 2^14 padded domain at the default H = 10 per field.
-    assert_eq!(
-      (
-        cfg.real_rows,
-        cfg.real_cols,
-        cfg.num_cons,
-        cfg.num_vars,
-        cfg.log_n
-      ),
-      (12990, 13017, 16384, 16384, 14)
-    );
-    let bd = RunConfig::parse(&env(&[("BDPCS", "1")])).unwrap();
-    assert_eq!(bd.backend, BenchBackend::Brakedown);
-    assert_eq!(bd.k, DEFAULT_BD_K);
+    assert_eq!(sorted, (K_RANGE.0..=K_RANGE.1).collect::<Vec<_>>());
+    for (i, k) in K_ORDER.iter().enumerate() {
+      assert!(is_candidate_k(*k));
+      assert_eq!(candidate_index(*k), Some(i as u32));
+    }
+    assert_eq!(candidate_index(6), None);
+    assert_eq!(candidate_index(14), None);
   }
 
   #[test]
   fn field_order_matches_the_circuit_module() {
-    // The bench-side string order is layout metadata for the SAME
-    // semantic order the circuit module pins.
     let circuit: Vec<&str> = crate::poseidon2::FIELD_ORDER
       .iter()
       .map(|f| f.name())
@@ -565,170 +354,90 @@ mod tests {
   }
 
   #[test]
-  fn boolean_flags_are_strict() {
-    // BDPCS=0 must NOT enable Brakedown (the old presence semantics).
-    let cfg = RunConfig::parse(&env(&[("BDPCS", "0")])).unwrap();
-    assert_eq!(cfg.backend, BenchBackend::Hyrax);
+  fn backends_tags_and_groups() {
+    assert_eq!(BenchBackend::Hyrax.tag(), 0);
+    assert_eq!(BenchBackend::Brakedown.tag(), 1);
+    assert_eq!(BenchBackend::ALL.map(BenchBackend::name), BACKEND_NAMES);
+    assert_eq!(BenchBackend::parse("hyrax"), Some(BenchBackend::Hyrax));
+    assert_eq!(BenchBackend::parse("Hyrax"), None);
+    assert_eq!(
+      BenchBackend::Hyrax.diagnostic_groups(),
+      DIAGNOSTIC_GROUPS.to_vec()
+    );
+    assert_eq!(
+      BenchBackend::Brakedown.diagnostic_groups(),
+      vec!["setup", "commit_witness", "prove_after_input_commit"]
+    );
+    assert!(!BenchBackend::Hyrax.uses_retained_cache());
+    assert!(BenchBackend::Brakedown.uses_retained_cache());
+  }
+
+  #[test]
+  fn default_k_follows_the_generated_module() {
+    for backend in BenchBackend::ALL {
+      match tuned_default(backend) {
+        None => assert_eq!(default_k(backend), V9_DEFAULT_K),
+        Some((k, id)) => {
+          assert_eq!(default_k(backend), k);
+          assert!(is_candidate_k(k));
+          assert_eq!(id.len(), 64);
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn canonical_dimensions() {
+    // 1299H rows, 1302H − 3 columns, one 2^14 × 2^14 padded domain at H = 10.
+    let d = poseidon_bench_dims(CANONICAL_HASHES_PER_FIELD).unwrap();
+    assert_eq!(
+      (d.num_cons, d.num_vars, d.log_cons, d.log_vars, d.log_n),
+      (16384, 16384, 14, 14, 14)
+    );
+    let by_k = dimensions_by_k(CANONICAL_HASHES_PER_FIELD).unwrap();
+    assert_eq!(
+      by_k.keys().copied().collect::<Vec<_>>(),
+      (7..=13).collect::<Vec<_>>()
+    );
+    assert!(by_k.values().all(|v| *v == d));
+    assert!(poseidon_bench_dims(0).is_err());
+    assert_eq!(
+      analytical_sumcheck_remainder_bytes(14, 14),
+      16 * (42 + 30 + 6)
+    );
+  }
+
+  #[test]
+  fn coins_seed_is_the_framed_blake3() {
+    let mut framed = BENCHMARK_COINS_DOMAIN.to_vec();
+    framed.push(1);
+    framed.extend_from_slice(&3u32.to_le_bytes());
+    framed.extend_from_slice(&9u32.to_le_bytes());
+    assert_eq!(
+      benchmark_coins_seed(BenchBackend::Brakedown, 3, 9),
+      *blake3::hash(&framed).as_bytes()
+    );
+    assert_ne!(
+      benchmark_coins_seed(BenchBackend::Hyrax, 0, 0),
+      benchmark_coins_seed(BenchBackend::Brakedown, 0, 0)
+    );
+    assert_ne!(
+      benchmark_coins_seed(BenchBackend::Hyrax, 0, 0),
+      benchmark_coins_seed(BenchBackend::Hyrax, 0, 1)
+    );
+  }
+
+  #[test]
+  fn env_helpers_are_strict() {
+    assert!(!parse_bool(&env(&[]), "X").unwrap());
+    assert!(parse_bool(&env(&[("X", "1")]), "X").unwrap());
+    assert!(!parse_bool(&env(&[("X", "0")]), "X").unwrap());
     for bad in ["true", "yes", "2", "", " 1"] {
-      assert!(
-        RunConfig::parse(&env(&[("BDPCS", bad)])).is_err(),
-        "{bad:?}"
-      );
-      assert!(
-        RunConfig::parse(&env(&[("PSIZE", bad)])).is_err(),
-        "{bad:?}"
-      );
-      assert!(
-        RunConfig::parse(&env(&[("KSWEEP", bad)])).is_err(),
-        "{bad:?}"
-      );
-      assert!(
-        RunConfig::parse(&env(&[("POSEIDON_ALLOW_LARGE", bad)])).is_err(),
-        "{bad:?}"
-      );
-      assert!(
-        RunConfig::parse(&env(&[("POSEIDON_ALLOW_KNOBS", bad)])).is_err(),
-        "{bad:?}"
-      );
-      assert!(
-        RunConfig::parse(&env(&[("POSEIDON_ALLOW_DIRTY", bad)])).is_err(),
-        "{bad:?}"
-      );
+      assert!(parse_bool(&env(&[("X", bad)]), "X").is_err(), "{bad:?}");
     }
-  }
-
-  #[test]
-  fn hashes_bounds_both_ends() {
-    assert!(RunConfig::parse(&env(&[("HASHES", "0")])).is_err());
-    assert_eq!(
-      RunConfig::parse(&env(&[("HASHES", "1")])).unwrap().hashes,
-      1
-    );
-    assert_eq!(
-      RunConfig::parse(&env(&[("HASHES", "256")])).unwrap().hashes,
-      256
-    );
-    assert!(RunConfig::parse(&env(&[("HASHES", "257")])).is_err());
-    let large = RunConfig::parse(&env(&[("HASHES", "257"), ("POSEIDON_ALLOW_LARGE", "1")]));
-    assert_eq!(large.unwrap().hashes, 257);
-    assert!(RunConfig::parse(&env(&[("HASHES", "abc")])).is_err());
-    assert!(
-      RunConfig::parse(&env(&[
-        ("HASHES", "4294967296"),
-        ("POSEIDON_ALLOW_LARGE", "1")
-      ]))
-      .is_err()
-    );
-  }
-
-  #[test]
-  fn k_override_bounds_and_backend_conflicts() {
-    for (key, backend_env) in [("IMOD_K", vec![]), ("BDK", vec![("BDPCS", "1")])] {
-      for k in ["6", "14"] {
-        let mut e = backend_env.clone();
-        e.push((key, k));
-        assert!(RunConfig::parse(&env(&e)).is_err(), "{key}={k}");
-      }
-      for k in ["7", "13"] {
-        let mut e = backend_env.clone();
-        e.push((key, k));
-        let cfg = RunConfig::parse(&env(&e)).unwrap();
-        assert_eq!(cfg.k, k.parse::<usize>().unwrap());
-        assert!(cfg.k_overridden);
-      }
-    }
-    // Both k variables: always an error.
-    assert!(RunConfig::parse(&env(&[("IMOD_K", "9"), ("BDK", "9")])).is_err());
-    // Irrelevant-backend k variables.
-    assert!(RunConfig::parse(&env(&[("BDK", "9")])).is_err()); // Hyrax rejects BDK
-    assert!(RunConfig::parse(&env(&[("BDPCS", "1"), ("IMOD_K", "9")])).is_err());
-  }
-
-  #[test]
-  fn ksweep_rejects_conflicting_presence() {
-    assert_eq!(
-      RunConfig::parse(&env(&[("KSWEEP", "1")])).unwrap().mode,
-      BenchMode::KSweep
-    );
-    // Presence is the conflict, even when the value equals a default.
-    for (key, val) in [
-      ("PSIZE", "0"),
-      ("HASHES", "10"),
-      ("IMOD_K", "9"),
-      ("BDK", "11"),
-      ("POSEIDON_ALLOW_LARGE", "0"),
-    ] {
-      assert!(
-        RunConfig::parse(&env(&[("KSWEEP", "1"), (key, val)])).is_err(),
-        "KSWEEP with {key}={val}"
-      );
-    }
-    // POSEIDON_ALLOW_KNOBS does not waive mode conflicts.
-    assert!(
-      RunConfig::parse(&env(&[
-        ("KSWEEP", "1"),
-        ("HASHES", "10"),
-        ("POSEIDON_ALLOW_KNOBS", "1")
-      ]))
-      .is_err()
-    );
-  }
-
-  #[test]
-  fn psize_mode_resolves() {
-    let cfg = RunConfig::parse(&env(&[("PSIZE", "1")])).unwrap();
-    assert_eq!(cfg.mode, BenchMode::ProofSize);
-  }
-
-  #[test]
-  fn hidden_knobs_require_the_override_and_validate() {
-    for knob in HIDDEN_KNOBS {
-      let e = env(&[(knob, "1")]);
-      assert!(RunConfig::parse(&e).is_err(), "{knob} without override");
-    }
-    // With the override: values are validated, not inherited blindly.
-    let ok = RunConfig::parse(&env(&[("POSEIDON_ALLOW_KNOBS", "1"), ("BDSPEC", "5")])).unwrap();
-    assert!(ok.knobs.contains_key("BDSPEC"));
-    assert!(RunConfig::parse(&env(&[("POSEIDON_ALLOW_KNOBS", "1"), ("BDSPEC", "6")])).is_err());
-    assert!(RunConfig::parse(&env(&[("POSEIDON_ALLOW_KNOBS", "1"), ("BDROWLEN", "0")])).is_err());
-    assert!(RunConfig::parse(&env(&[("POSEIDON_ALLOW_KNOBS", "1"), ("BDDIRECT", "x")])).is_err());
-    // Presence-sensitive knobs: "0" is still present (and permitted only
-    // under the override).
-    let cfg = RunConfig::parse(&env(&[("POSEIDON_ALLOW_KNOBS", "1"), ("BDSPLIT", "0")])).unwrap();
-    assert!(cfg.knobs["BDSPLIT"].effective.contains("present"));
-    // GKRSKIP inverted sense.
-    let cfg = RunConfig::parse(&env(&[("POSEIDON_ALLOW_KNOBS", "1"), ("GKRSKIP", "0")])).unwrap();
-    assert!(cfg.knobs["GKRSKIP"].effective.contains("DISABLED"));
-    let cfg = RunConfig::parse(&env(&[("POSEIDON_ALLOW_KNOBS", "1"), ("GKRSKIP", "1")])).unwrap();
-    assert!(cfg.knobs["GKRSKIP"].effective.contains("enabled"));
-    // RUST_LOG must be EnvFilter-valid.
-    assert!(RunConfig::parse(&env(&[("POSEIDON_ALLOW_KNOBS", "1"), ("RUST_LOG", "info")])).is_ok());
-    assert!(
-      RunConfig::parse(&env(&[
-        ("POSEIDON_ALLOW_KNOBS", "1"),
-        ("RUST_LOG", "info[=]/")
-      ]))
-      .is_err()
-    );
-  }
-
-  #[test]
-  fn protocol_bytes_are_deterministic_and_extractable() {
-    let cfg = RunConfig::parse(&env(&[])).unwrap();
-    let a = cfg.protocol_canonical_bytes();
-    let b = cfg.protocol_canonical_bytes();
-    assert_eq!(a, b);
-    let full = serde_json::json!({ "protocol": cfg.protocol_json(), "environment": {} });
-    let extracted =
-      protocol_bytes_from_full_config(&serde_json::to_string(&full).unwrap()).unwrap();
-    assert_eq!(a, extracted);
-    // A config difference changes the protocol bytes.
-    let other = RunConfig::parse(&env(&[("BDPCS", "1")])).unwrap();
-    assert_ne!(a, other.protocol_canonical_bytes());
-  }
-
-  #[test]
-  fn non_unicode_values_are_rejected() {
+    assert_eq!(parse_usize(&env(&[("H", "10")]), "H").unwrap(), Some(10));
+    assert!(parse_usize(&env(&[("H", "abc")]), "H").is_err());
+    assert!(is_present(&env(&[("BDSPLIT", "0")]), "BDSPLIT"));
     #[cfg(unix)]
     {
       use std::os::unix::ffi::OsStringExt;
@@ -737,15 +446,16 @@ mod tests {
         OsString::from("HASHES"),
         OsString::from_vec(vec![0x66, 0xff, 0xfe]),
       );
-      assert!(RunConfig::parse(&e).is_err());
-      // Presence-only knobs are covered too.
-      let mut e = BTreeMap::new();
-      e.insert(
-        OsString::from("BDSPLIT"),
-        OsString::from_vec(vec![0xff, 0xfe]),
-      );
-      e.insert(OsString::from("POSEIDON_ALLOW_KNOBS"), OsString::from("1"));
-      assert!(RunConfig::parse(&e).is_err());
+      assert!(get_unicode(&e, "HASHES").is_err());
     }
+  }
+
+  #[test]
+  fn protocol_bytes_are_extractable() {
+    let full = serde_json::json!({ "protocol": { "b": 1, "a": [1, 2] }, "environment": {} });
+    let extracted =
+      protocol_bytes_from_full_config(&serde_json::to_string(&full).unwrap()).unwrap();
+    assert_eq!(extracted, canonical_json_bytes(&full["protocol"]));
+    assert!(protocol_bytes_from_full_config("{}").is_err());
   }
 }
