@@ -20,26 +20,33 @@ from scripts.tests import support
 from scripts.tests.test_poseidon_runner import only_dir
 
 
+# The historical full-size k order (every admissible k, N = 7) keeps the multi-candidate
+# schedule arithmetic covered now that the pinned epoch (`pc.K_ORDER`) schedules a single k.
+FULL_K_ORDER = (10, 7, 12, 9, 13, 8, 11)
+FULL_SIMPLICITY_ORDER = tuple(sorted(FULL_K_ORDER))
+
+
 class ScheduleArithmeticTests(unittest.TestCase):
     """The full-size TUNE-1 schedule: N = 7, 2N = 14 blocks, 9N = 63 processes per block,
-    18N^2 = 882 children, ordinals 1..882, position balance, simplicity order."""
+    18N^2 = 882 children, ordinals 1..882, position balance, simplicity order; plus the
+    pinned single-candidate schedule (N = 1: 2 blocks x 9 = 18 children)."""
 
     def test_full_size_counts(self):
-        n = len(pc.CANDIDATES)
+        n = len(FULL_K_ORDER)
         self.assertEqual(n, 7)
-        self.assertEqual(pc.CANDIDATES, (10, 7, 12, 9, 13, 8, 11))
-        self.assertEqual(pc.SIMPLICITY_ORDER, (7, 8, 9, 10, 11, 12, 13))
-        orders = t1.block_orders(pc.CANDIDATES)
+        self.assertEqual(sorted(FULL_K_ORDER), list(range(pc.K_RANGE[0], pc.K_RANGE[1] + 1)))
+        self.assertEqual(FULL_SIMPLICITY_ORDER, (7, 8, 9, 10, 11, 12, 13))
+        orders = t1.block_orders(FULL_K_ORDER)
         self.assertEqual(len(orders), 2 * n)
-        self.assertEqual(orders[0], list(pc.CANDIDATES))
+        self.assertEqual(orders[0], list(FULL_K_ORDER))
         self.assertEqual(orders[1], [7, 12, 9, 13, 8, 11, 10])
         self.assertEqual(orders[n], [11, 8, 13, 9, 12, 7, 10])
         self.assertEqual(orders[n + 1], [8, 13, 9, 12, 7, 10, 11])
         # Every candidate occupies every within-block position exactly twice.
-        for k in pc.CANDIDATES:
+        for k in FULL_K_ORDER:
             for pos in range(n):
                 self.assertEqual(sum(1 for o in orders if o[pos] == k), 2, (k, pos))
-        schedule = t1.schedule(pc.CANDIDATES, pc.TUNING_INSTANCES)
+        schedule = t1.schedule(FULL_K_ORDER, pc.TUNING_INSTANCES)
         self.assertEqual(len(schedule), 18 * n * n)
         self.assertEqual(len(schedule), 882)
         per_block = {}
@@ -68,18 +75,50 @@ class ScheduleArithmeticTests(unittest.TestCase):
         """A synthetic full-size result (882 processes) reproduces through the re-checker."""
         from fractions import Fraction as F
         processes = {}
-        for (b, o, cand, inst) in t1.schedule(pc.CANDIDATES, pc.TUNING_INSTANCES):
+        for (b, o, cand, inst) in t1.schedule(FULL_K_ORDER, pc.TUNING_INSTANCES):
             point = F(1000 + (cand - 7) * 40 + b)
             processes[(cand, inst, b)] = {"point": point, "lower": point - 5, "upper": point + 5}
-        result = t1.tuning_result({"backend": "brakedown"}, {}, list(pc.CANDIDATES),
+        result = t1.tuning_result({"backend": "brakedown"}, {}, list(FULL_K_ORDER),
                                   list(pc.TUNING_INSTANCES), processes, {},
-                                  simplicity_order=list(pc.SIMPLICITY_ORDER))
+                                  simplicity_order=list(FULL_SIMPLICITY_ORDER))
         self.assertEqual(len(result["process_estimates"]), 882)
         self.assertEqual(len(result["blocks"]), 14)
         self.assertEqual(result["decision"], {"selected": 7,
                                               "selection_basis": "simplest_unique_best"})
         self.assertEqual(sorted(result["aggregate"]["scores"]),
-                         sorted(str(k) for k in pc.CANDIDATES))
+                         sorted(str(k) for k in FULL_K_ORDER))
+        t1.recheck_tuning_result(pc.load_canonical_json(pc.canonical_json_bytes(result)))
+
+    def test_pinned_single_candidate_schedule(self):
+        """The pinned epoch schedules `pc.K_ORDER` alone: 2N blocks x 9N children (18 for
+        N = 1) and the lone candidate is selected as `only_admissible`."""
+        from fractions import Fraction as F
+        cands = list(pc.K_ORDER)
+        n = len(cands)
+        self.assertEqual(pc.SIMPLICITY_ORDER, tuple(sorted(cands)))
+        orders = t1.block_orders(cands)
+        self.assertEqual(len(orders), 2 * n)
+        self.assertEqual(orders[0], cands)
+        self.assertEqual(orders[n], list(reversed(cands)))
+        schedule = t1.schedule(cands, pc.TUNING_INSTANCES)
+        self.assertEqual(len(schedule), 18 * n * n)
+        names = ["children/block-%d/%s" % (b, t1.child_dir_name(o, c, i))
+                 for (b, o, c, i) in schedule]
+        self.assertEqual(len(set(names)), len(schedule))
+        processes = {}
+        for (b, o, cand, inst) in schedule:
+            point = F(1000 + b)
+            processes[(cand, inst, b)] = {"point": point, "lower": point - 5, "upper": point + 5}
+        result = t1.tuning_result({"backend": "hyrax"}, {}, cands, list(pc.TUNING_INSTANCES),
+                                  processes, {}, simplicity_order=list(pc.SIMPLICITY_ORDER))
+        self.assertEqual(len(result["process_estimates"]), len(schedule))
+        self.assertEqual(result["decision"]["selected"], pc.SIMPLICITY_ORDER[0])
+        self.assertEqual(result["decision"]["selection_basis"],
+                         "only_admissible" if n == 1 else "simplicity_tie_band")
+        if n == 1:
+            self.assertEqual((len(orders), len(schedule)), (2, 18))
+            self.assertEqual(names[0], "children/block-0/00-k%d-inst1" % cands[0])
+            self.assertEqual(names[-1], "children/block-1/08-k%d-inst9" % cands[0])
         t1.recheck_tuning_result(pc.load_canonical_json(pc.canonical_json_bytes(result)))
 
 

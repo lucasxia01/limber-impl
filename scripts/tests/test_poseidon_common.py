@@ -85,9 +85,15 @@ class SystemProfileTests(unittest.TestCase):
     def test_constants(self):
         self.assertEqual(pc.SYSTEM_ROLES, ("hyrax", "brakedown"))
         self.assertEqual(pc.VARIANTS, pc.BACKENDS)
-        self.assertEqual(pc.K_ORDER, (10, 7, 12, 9, 13, 8, 11))
+        # Single-candidate TUNE-1 epoch (tuning-protocol-v2 `single_candidate_epoch`): the
+        # pinned order is just the persisted default k = 9 inside the admissible range.
+        self.assertEqual(pc.K_ORDER, (9,))
+        self.assertEqual(pc.K_RANGE, (7, 13))
         self.assertEqual(pc.CANDIDATES, pc.K_ORDER)
-        self.assertEqual(pc.SIMPLICITY_ORDER, (7, 8, 9, 10, 11, 12, 13))
+        self.assertEqual(pc.SIMPLICITY_ORDER, tuple(sorted(pc.K_ORDER)))
+        self.assertEqual(pc.SIMPLICITY_ORDER, (9,))
+        self.assertEqual(len(set(pc.K_ORDER)), len(pc.K_ORDER))
+        self.assertTrue(all(pc.K_RANGE[0] <= k <= pc.K_RANGE[1] for k in pc.K_ORDER))
         self.assertEqual(pc.TUNING_INSTANCES, tuple(range(1, 10)))
         self.assertEqual(pc.CHECK_MODES, {"shadow": "not_applicable", "timed": "release"})
         self.assertEqual(pc.PRIME_SAMPLER_ID,
@@ -206,19 +212,38 @@ class CommandTests(unittest.TestCase):
     def test_dimensions_by_candidate(self):
         raw = support.metadata_for(support.REAL_REPO)
         md = pc.ProtocolMetadata(raw, ["cargo"])
+        # The default is the pinned schedule (K_ORDER); the compiled `dimensions_by_k`
+        # covers the whole admissible range, so any explicit k in K_RANGE resolves.
         dims = pc.dimensions_by_candidate(md)
         self.assertEqual(sorted(dims), sorted(str(k) for k in pc.K_ORDER))
         self.assertEqual(dims["9"], {"log_cons": 14, "log_vars": 14})
+        lo, hi = pc.K_RANGE
+        full = pc.dimensions_by_candidate(md, range(lo, hi + 1))
+        self.assertEqual(sorted(full, key=int), [str(k) for k in range(lo, hi + 1)])
+        for k in range(lo, hi + 1):
+            self.assertEqual(pc.dimensions_by_candidate(md, [k]),
+                             {str(k): {"log_cons": 14, "log_vars": 14}})
+        # A k outside 7..=13 has no compiled dimensions and is rejected.
+        for k in (lo - 1, hi + 1):
+            with self.assertRaises(pc.RunnerError) as cm:
+                pc.dimensions_by_candidate(md, [k])
+            self.assertEqual(cm.exception.error_code, "MetadataMalformed")
+        # An admissible k whose entry is missing or malformed is rejected, whether it
+        # is requested explicitly or as part of the pinned schedule.
         del md.raw["dimensions_by_k"]["11"]
         with self.assertRaises(pc.RunnerError) as cm:
-            pc.dimensions_by_candidate(md)
+            pc.dimensions_by_candidate(md, [11])
         self.assertEqual(cm.exception.error_code, "MetadataMalformed")
         md.raw["dimensions_by_k"]["11"] = {"log_cons": 14}
         with self.assertRaises(pc.RunnerError):
-            pc.dimensions_by_candidate(md)
+            pc.dimensions_by_candidate(md, [11])
         md.raw["dimensions_by_k"]["11"] = {"log_cons": 14, "log_vars": True}
         with self.assertRaises(pc.RunnerError):
+            pc.dimensions_by_candidate(md, [11])
+        del md.raw["dimensions_by_k"][str(pc.K_ORDER[0])]
+        with self.assertRaises(pc.RunnerError) as cm:
             pc.dimensions_by_candidate(md)
+        self.assertEqual(cm.exception.error_code, "MetadataMalformed")
 
     def test_error_code_sections(self):
         self.assertIn("RejectedEnvironment", pc.ERROR_CODES)
