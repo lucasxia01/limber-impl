@@ -256,8 +256,9 @@ manifest = {
     "run_id": os.path.basename(run_dir),
     "config_sha256": sha,
     "publishable": cfg["environment"]["publishable"]
-        and cfg["protocol"]["canonical_comparison"],
-    "canonical_comparison": cfg["protocol"]["canonical_comparison"],
+        and cfg["protocol"]["canonical_env_common"],
+    "canonical_comparison": cfg["environment"]["publishable"]
+        and cfg["protocol"]["canonical_env_common"],
     "started_utc": start,
     "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "exit_code": 0,

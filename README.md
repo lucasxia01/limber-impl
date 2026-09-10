@@ -222,3 +222,54 @@ Cryptology ePrint Archive 2026/855
 ## License
 
 MIT, inherited from the upstream [Spartan2](https://github.com/Microsoft/Spartan2) project — see [LICENSE](LICENSE).
+
+<!-- poseidon2-bench:begin -->
+## Poseidon2 non-native-field benchmark
+
+Thirty Poseidon2 compressions (t = 3, α = 5, R_F = 8, R_P = 56) proven in ONE mixed-modulus circuit: three independent ten-compression chains — one per field block, BN254-Fr, BLS12-381-Fr, secp256k1-Fr, in that fixed order — each restarting from the same fixed IV and ending at its own ordered public digest (num_io = 3; 12,990 real rows padded once to 2^14 × 2^14). **This permutation is a benchmark workload, not a security-reviewed production hash** (custom BLAKE3-derived constants). **No zero-knowledge claim is made for this driver**: Hyrax commitments are hiding, Brakedown commitments are not, and the sumcheck transcript carries unmasked witness-dependent data regardless of backend; "messages are private" means *not public IO*, not confidential. Verification must go through `limber::poseidon2::verify_poseidon_chain` — bypassing it forfeits the three-digest canonicality guarantee. Published Brakedown timings are layout-warm steady state with an empty retained cache per measured sample.
+
+| run id | backend | mode | H/field (total) | k | git | config |
+| --- | --- | --- | ---: | ---: | --- | --- |
+| [`20260910T143911Z-cfg-550923735ba7`](bench-results/poseidon2/20260910T143911Z-cfg-550923735ba7/) | hyrax | normal | 10 (30) | 9 | `5a9be0e1dfa1` | `cfg-550923735ba7` |
+| [`20260910T144208Z-cfg-6bde446e6974`](bench-results/poseidon2/20260910T144208Z-cfg-6bde446e6974/) | hyrax | proof_size | 10 (30) | 9 | `5a9be0e1dfa1` | `cfg-6bde446e6974` |
+
+Raw Criterion data, immutable run configs, manifests, and proof-size / k-sweep sidecars live in each run directory. Reproduce with the exact commands in `scripts/run_poseidon_bench.sh` (see plan §12).
+<!-- poseidon2-bench:end -->
+
+<!-- poseidon2-spartan-bench:begin -->
+## Emulated-field baseline (classic Spartan)
+
+The same 30-hash Poseidon2 workload proven as ONE limb-emulated circuit under classic Spartan (`SpartanSNARK<T256HyraxEngine>`, 4 × 64-bit limbs via the revision-pinned `bellpepper-emulated` gadget): 9,454,119 real constraints padded to 2^24, against the ModP circuit's 12,990 rows padded to 2^14. The statement is existence-only, identical to the ModP suite's; **no zero-knowledge claim is made**. The emulated circuit is a good-faith optimized baseline (free linear layers, measured lazy-reduction schedule: two explicit reductions per S-box plus lanes 1–2 every 8th partial round), not a strawman. `prep_prove` is included in the headline `prove_e2e` prover time. Classic Spartan physically serializes the 12 public limb scalars; the comparison payload excludes that statement data by convention, and its component sizes are canonical bincode while the ModP sumcheck remainder is an analytical payload without framing, so proof-size comparisons are not exact wire-format ratios. Hyrax-vs-Hyrax only: ModP Brakedown rows have no counterpart here. Verification must go through `limber::poseidon2_spartan::verify_poseidon_spartan`. This is the measured baseline the ModP plan's §4 declined to estimate.
+
+| run id | mode | H/field (total) | padded | git | config |
+| --- | --- | ---: | --- | --- | --- |
+| [`20260910T140604Z-spartan-cfg-7ed4f9986484`](bench-results/poseidon2-spartan/20260910T140604Z-spartan-cfg-7ed4f9986484/) | normal | 10 (30) | 2^24 × 2^24 | `5a9be0e1dfa1` | `cfg-7ed4f9986484` |
+| [`20260910T143206Z-spartan-cfg-0e29b40d66ad`](bench-results/poseidon2-spartan/20260910T143206Z-spartan-cfg-0e29b40d66ad/) | proof_size | 10 (30) | 2^24 × 2^24 | `5a9be0e1dfa1` | `cfg-0e29b40d66ad` |
+
+Raw Criterion data, immutable run configs, manifests, and the proof-size sidecar live in each run directory. Reproduce with `scripts/run_poseidon_spartan_bench.sh` (see plan/poseidon_spartan_bench.md §6, §10).
+<!-- poseidon2-spartan-bench:end -->
+
+### Limber vs emulated-field baseline: the headline comparison
+
+Canonical `H = 10` runs (30 Poseidon2 compressions across BN254-Fr,
+BLS12-381-Fr, secp256k1-Fr), single-threaded, `-C target-cpu=native`,
+Apple M4 Pro, commit `5a9be0e`, Hyrax-vs-Hyrax. Medians with Criterion 95%
+intervals; ModP runs `20260910T143911Z-cfg-550923735ba7` /
+`…144208Z-cfg-6bde446e6974`, spartan runs
+`20260910T140604Z-spartan-cfg-7ed4f9986484` / `…143206Z-spartan-cfg-0e29b40d66ad`.
+
+| Metric | Limber ModP (Hyrax) | Emulated classic Spartan | Ratio |
+| --- | ---: | ---: | ---: |
+| Real constraints (padded) | 12,990 (2^14) | 9,454,119 (2^24) | **728×** |
+| `prove_e2e` median | 1.31 s [1.17, 1.57] | 38.54 s [34.07, 42.12] | **29×** |
+| `verify` median | 92.3 ms [78.5, 113.1] | 4.51 s [4.25, 5.50] | **49×** |
+| `setup` median (not headlined; domains differ) | 212.7 ms | 50.2 s | 236× |
+| Proof comparison payload | 138,901 B | 340,508 B | **2.5×** |
+
+Proof-size caveat (disclosed, not hidden): the spartan payload is exact
+canonical bincode (340,900 B wire including the 392 B public values),
+while ModP's sumcheck remainder (1,248 B of its 138,901 B payload —
+commitments 8,472 B + eval argument 129,181 B) is an analytical figure
+without framing, so the 2.5× is not an exact wire-format ratio. Row and
+time ratios are quoted separately by design — never a single blended “×”.
+
