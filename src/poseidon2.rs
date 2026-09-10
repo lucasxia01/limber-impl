@@ -37,6 +37,7 @@ use crate::{
   errors::SpartanError,
   imod_r1cs_modp::{IntModR1CSInstanceModp, IntModR1CSShapeModp},
   imod_spartan_modp::{IntModSpartanModpSNARK, IntModSpartanModpVerifierKey},
+  prime_sampler::PrimeAuditedOutcome,
   provider::keccak::Keccak256Transcript,
   traits::mod_engine::ModEngine,
 };
@@ -74,8 +75,92 @@ const M_I: [[u64; 3]; 3] = [[2, 1, 1], [1, 2, 1], [1, 1, 3]];
 
 /// Domain-separation prefix for the round-constant XOF.
 const RC_DOMAIN: &[u8] = b"limber-poseidon2-v1/rc";
-/// Domain-separation prefix for the benchmark message XOF.
+/// Domain-separation prefix for the instance-0 benchmark message hash.
 const MSG_DOMAIN: &[u8] = b"limber-poseidon2-v1/msg";
+/// Domain-separation prefix for the tuning-instance (`instance >= 1`)
+/// benchmark message hash; identical to Zinc's `MSG_INSTANCE_DOMAIN`.
+const MSG_INSTANCE_DOMAIN: &[u8] = b"limber-poseidon2-v1/msg/inst";
+/// Benchmark messages are masked to this many low bits so that every
+/// message is canonical for all three fields (`2^250 < min p`).
+pub const MESSAGE_BITS: u32 = 250;
+/// Compressions per field in the canonical KAT and tuning workload
+/// (`H = 10`, thirty compressions in the combined circuit).
+pub const KAT_HASHES_PER_FIELD: usize = 10;
+/// SHA-256 of the exact bytes of [`KAT_FIXTURE_PATH`], the known-answer
+/// fixture shared byte-for-byte with Zinc (`POSEIDON2_KAT_V1_SHA256`
+/// there); it doubles as the canonical fixture/parameter-set identity.
+pub const KAT_FIXTURE_SHA256: &str =
+  "db2d7fd7e3de653c8813b21be8ee1ffb9234dc36505bbfc0edd85af41bbed0bd";
+/// Path of the KAT fixture relative to the crate root.
+pub const KAT_FIXTURE_PATH: &str = "tests/data/poseidon2_kat_v1.json";
+/// SHA-256 of the exact bytes of [`TUNE_CORPUS_PATH`], the TUNE-1 tuning
+/// corpus (instances `1..=9` at `H = 10`) shared byte-for-byte with Zinc.
+pub const TUNING_CORPUS_ID: &str =
+  "956ee80b9513a2adbc09dd1a9eb6028f8cf52107d56fc0ccbba92f29815daae0";
+/// Path of the tuning corpus relative to the crate root.
+pub const TUNE_CORPUS_PATH: &str = "tests/data/tune-corpus-v1.json";
+/// Tuning instances of the corpus, in order. Instance `0` (the KAT
+/// workload of [`build_inputs`]) is held out of tuning.
+pub const TUNING_INSTANCES: [u32; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+/// Compiled identifiers of the shared cross-system Poseidon2 benchmark
+/// specification (Zinc plan v10 §9; limber contract §1). Every `*_ID` /
+/// `*_SHA256` digest is the SHA-256 of the exact bytes of the named file,
+/// pinned by `tests/poseidon_specs.rs`; the three `*-v2.json` schema files
+/// are byte-identical copies of Zinc's `specs/poseidon/` files and
+/// `security-accounting-v1.json` is limber's own canonical event file.
+pub mod ids {
+  /// Directory of the specification files, relative to the crate root.
+  pub const SPEC_DIR: &str = "specs/poseidon";
+  /// Path of the shared timing schema (Criterion ID grammar and estimate
+  /// layout), relative to the crate root.
+  pub const TIMING_SCHEMA_PATH: &str = "specs/poseidon/timing-schema-v2.json";
+  /// SHA-256 of the exact bytes of [`TIMING_SCHEMA_PATH`].
+  pub const TIMING_SCHEMA_ID: &str =
+    "d859a6be45e0b18dc913f4e427f2283849f3567cb757c9af9f9e41eea7fc4fbe";
+  /// Path of the shared TUNE-1 tuning protocol, relative to the crate root.
+  pub const TUNING_PROTOCOL_PATH: &str = "specs/poseidon/tuning-protocol-v2.json";
+  /// SHA-256 of the exact bytes of [`TUNING_PROTOCOL_PATH`].
+  pub const TUNING_PROTOCOL_ID: &str =
+    "2e09b0cafbf2b1f7752936499bbfa9aadcb4408a20713871475882559913bec9";
+  /// Path of the shared cross-system comparison schema, relative to the
+  /// crate root.
+  pub const COMPARISON_SCHEMA_PATH: &str = "specs/poseidon/comparison-schema-v2.json";
+  /// SHA-256 of the exact bytes of [`COMPARISON_SCHEMA_PATH`].
+  pub const COMPARISON_SCHEMA_ID: &str =
+    "8bc32c1648ee77c12227f315f1f8232f7e15435310044c96f03d414344f1ab2e";
+  /// Path of limber's security-accounting event file (schema
+  /// `limber/security-accounting/v1`), relative to the crate root.
+  pub const SECURITY_ACCOUNTING_PATH: &str = "specs/poseidon/security-accounting-v1.json";
+  /// SHA-256 of the exact bytes of [`SECURITY_ACCOUNTING_PATH`].
+  pub const SECURITY_ACCOUNTING_ID: &str =
+    "89635dad3b1dee64122f855d100becaa0ea5374c91d407fc8a7691c826461414";
+  /// Path of the KAT fixture relative to the crate root.
+  pub const KAT_FIXTURE_PATH: &str = super::KAT_FIXTURE_PATH;
+  /// SHA-256 of the exact bytes of the KAT fixture.
+  pub const KAT_FIXTURE_SHA256: &str = super::KAT_FIXTURE_SHA256;
+  /// Path of the tuning corpus relative to the crate root.
+  pub const TUNE_CORPUS_PATH: &str = super::TUNE_CORPUS_PATH;
+  /// SHA-256 of the exact bytes of the tuning corpus.
+  pub const TUNING_CORPUS_ID: &str = super::TUNING_CORPUS_ID;
+  /// Identifier of the deterministic benchmark-coins policy (the tuning
+  /// protocol's `systems.limber.benchmark_coins_id`).
+  pub const BENCHMARK_COINS_ID: &str = "poseidon-bench-chacha20-v1";
+  /// Framing of the benchmark-coins seed, verbatim from the tuning
+  /// protocol's `systems.limber.benchmark_coins.framing`: the seed is the
+  /// unkeyed 32-byte BLAKE3 hash of [`BENCHMARK_COINS_DOMAIN`] followed by
+  /// the backend tag (hyrax 0, brakedown 1), the zero-based index of `k`
+  /// in [`K_ORDER`] as `u32` little-endian, and the instance as `u32`
+  /// little-endian.
+  pub const BENCHMARK_COINS_FRAMING: &str = r#""limber-poseidon2-v1/bench-coins/v1\0" || backend_u8 || candidate_index_le32 || instance_le32"#;
+  /// The leading bytes of the benchmark-coins seed framing, including the
+  /// terminating NUL (the tuning protocol's `framing_bytes_hex_prefix`).
+  pub const BENCHMARK_COINS_DOMAIN: &[u8] = b"limber-poseidon2-v1/bench-coins/v1\0";
+  /// The pinned TUNE-1 candidate order of `k` (the tuning protocol's
+  /// `systems.limber.k_order`); a candidate's zero-based position here is
+  /// its `candidate_index` in the benchmark-coins seed.
+  pub const K_ORDER: [usize; 7] = [10, 7, 12, 9, 13, 8, 11];
+}
 
 /// Target scalar field for the Poseidon2 workload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,7 +360,7 @@ fn checked_hashes(hashes: usize) -> Result<u32, SpartanError> {
 /// checked. Returns
 /// `(block_rows, block_cols, real_rows, real_cols, num_cons, num_vars, log_n)`.
 #[allow(clippy::type_complexity)]
-fn checked_dims(
+pub(crate) fn checked_dims(
   hashes: usize,
 ) -> Result<(usize, usize, usize, usize, usize, usize, usize), SpartanError> {
   checked_hashes(hashes)?;
@@ -604,25 +689,54 @@ pub fn build_all_params() -> Result<Poseidon2ParamsSet, SpartanError> {
   })
 }
 
-/// Deterministic benchmark messages `m_1..m_H`: BLAKE3 XOF of
-/// `"limber-poseidon2-v1/msg" ‖ j_be4`, first 32 bytes big-endian, masked
-/// to the low 250 bits — canonical for all three fields (`< 2^250 < min p`).
+/// Deterministic benchmark messages `m_1..m_H` of tuning instance
+/// `instance`, indexed `j = 1..=H` (`u32` big-endian):
+///
+/// * instance `0`, the held-out KAT workload:
+///   `BLAKE3("limber-poseidon2-v1/msg" ‖ j_be4)`;
+/// * instance `k >= 1`:
+///   `BLAKE3("limber-poseidon2-v1/msg/inst" ‖ k_be4 ‖ j_be4)`.
+///
+/// Either way the 32-byte BLAKE3 output is read big-endian and masked to
+/// the low [`MESSAGE_BITS`] bits, so every message is canonical for all
+/// three fields (`< 2^250 < min p`). Byte-identical to Zinc's
+/// `build_inputs_instance`; instances `1..=9` are pinned by the tuning
+/// corpus ([`TUNE_CORPUS_PATH`]) and any `u32` instance is computable.
 /// The combined builder copies these `H` values into each block's distinct
-/// message columns (`3H` slots total): a fixture choice for value-for-value
-/// comparability, not a cross-field equality constraint.
-pub fn build_inputs(hashes_per_field: usize) -> Result<Vec<BigUint>, SpartanError> {
+/// message columns (`3H` slots total): a fixture choice for
+/// value-for-value comparability, not a cross-field equality constraint.
+pub fn build_inputs_instance(
+  instance: u32,
+  hashes_per_field: usize,
+) -> Result<Vec<BigUint>, SpartanError> {
   checked_hashes(hashes_per_field)?;
-  let mask = (BigUint::one() << 250u32) - BigUint::one();
+  let mask = (BigUint::one() << MESSAGE_BITS) - BigUint::one();
   let mut out = Vec::with_capacity(hashes_per_field);
   for j in 1..=hashes_per_field {
+    // `j <= H <= u32::MAX` was established by `checked_hashes`.
+    let j_be = u32::try_from(j)
+      .map_err(|_| SpartanError::InternalError {
+        reason: format!("poseidon2: message index {j} exceeds u32::MAX"),
+      })?
+      .to_be_bytes();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(MSG_DOMAIN);
-    hasher.update(&(j as u32).to_be_bytes());
-    let mut buf = [0u8; 32];
-    hasher.finalize_xof().fill(&mut buf);
-    out.push(BigUint::from_bytes_be(&buf) & &mask);
+    if instance == 0 {
+      hasher.update(MSG_DOMAIN);
+    } else {
+      hasher.update(MSG_INSTANCE_DOMAIN);
+      hasher.update(&instance.to_be_bytes());
+    }
+    hasher.update(&j_be);
+    out.push(BigUint::from_bytes_be(hasher.finalize().as_bytes()) & &mask);
   }
   Ok(out)
+}
+
+/// The instance-0 benchmark messages `m_1..m_H` (the KAT workload):
+/// `BLAKE3("limber-poseidon2-v1/msg" ‖ j_be4)` masked to the low 250 bits.
+/// A thin wrapper of [`build_inputs_instance`] with `instance = 0`.
+pub fn build_inputs(hashes_per_field: usize) -> Result<Vec<BigUint>, SpartanError> {
+  build_inputs_instance(0, hashes_per_field)
 }
 
 /// Reference Poseidon2 permutation on canonical field elements. Rejects a
@@ -1355,6 +1469,30 @@ where
   proof.verify(&vk.inner, instance)
 }
 
+/// [`verify_poseidon_chain`] with the verifier's complete P0-D
+/// prime-sampler audit log (the records of
+/// `IntModSpartanModpSNARK::verify_with_prime_audit`): the same ordered
+/// three-digest canonicality policy runs first, and a canonicality
+/// failure is reported as a `Failure` with an empty record list (no
+/// transcript draw happened). The benchmark preflight compares these
+/// records with the prover's.
+pub fn verify_poseidon_chain_with_prime_audit<M>(
+  vk: &PoseidonVerifierKey<M>,
+  instance: &IntModR1CSInstanceModp<M>,
+  proof: &IntModSpartanModpSNARK<M>,
+) -> PrimeAuditedOutcome<()>
+where
+  M: ModEngine<TE = Keccak256Transcript<M>>,
+{
+  if let Err(source) = check_canonical_io_inner(&instance.x, &vk.moduli) {
+    return PrimeAuditedOutcome::Failure {
+      source,
+      records: Vec::new(),
+    };
+  }
+  proof.verify_with_prime_audit(&vk.inner, instance)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1860,6 +1998,207 @@ mod tests {
       let rust_flat: Vec<BigUint> = params.rc.iter().flatten().cloned().collect();
       assert_eq!(flat, rust_flat, "round constants for {}", field.name());
       assert_eq!(from_hex(&entry["iv"]), chain_iv());
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Cross-system gates (Zinc plan v10 §9): the runner executes exactly
+  // `cargo test --locked --offline --release --color never --lib -vv -- --exact poseidon2::tests::kat_gate`
+  // and `... --exact poseidon2::tests::tuning_corpus_gate`.
+
+  /// A crate-relative data path.
+  fn crate_path(rel: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+  }
+
+  /// Lowercase hex SHA-256 of `bytes`.
+  fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+      .iter()
+      .map(|b| format!("{b:02x}"))
+      .collect()
+  }
+
+  /// A fixture value: exactly 64 lowercase hex digits (32 bytes, big-endian).
+  fn hex_value(v: &serde_json::Value) -> BigUint {
+    let s = v.as_str().expect("hex string");
+    assert_eq!(s.len(), 64, "32-byte lowercase hex");
+    assert!(
+      s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+      "lowercase hex digits only"
+    );
+    BigUint::parse_bytes(s.as_bytes(), 16).expect("valid hex")
+  }
+
+  /// A fixture array of hex values.
+  fn hex_array(v: &serde_json::Value) -> Vec<BigUint> {
+    v.as_array().expect("array").iter().map(hex_value).collect()
+  }
+
+  /// A fixture 3×3 small-integer matrix.
+  fn matrix(v: &serde_json::Value) -> [[u64; 3]; 3] {
+    core::array::from_fn(|i| core::array::from_fn(|j| v[i][j].as_u64().expect("matrix entry")))
+  }
+
+  #[test]
+  fn instance_messages_are_canonical_and_distinct() {
+    let h = KAT_HASHES_PER_FIELD;
+    // Instance 0 is exactly `build_inputs`.
+    assert_eq!(
+      build_inputs_instance(0, h).unwrap(),
+      build_inputs(h).unwrap()
+    );
+    // Every instance's messages are below 2^250, hence canonical for all
+    // three fields, and pairwise distinct across instances 0..=9.
+    let bound = BigUint::one() << MESSAGE_BITS;
+    let all: Vec<Vec<BigUint>> = (0..=9u32)
+      .map(|k| build_inputs_instance(k, h).unwrap())
+      .collect();
+    for msgs in &all {
+      assert_eq!(msgs.len(), h);
+      assert!(msgs.iter().all(|m| *m < bound));
+    }
+    for (a, x) in all.iter().enumerate() {
+      for (b, y) in all.iter().enumerate() {
+        if a != b {
+          assert_ne!(x, y, "instances {a} and {b} collide");
+        }
+      }
+    }
+    // A prefix property: the first H' messages of an instance are the same
+    // at any larger H (the index framing does not depend on H).
+    assert_eq!(build_inputs_instance(3, 4).unwrap(), all[3][..4].to_vec());
+    // Any u32 instance is computable; bounds are enforced as for `build_inputs`.
+    assert_eq!(build_inputs_instance(u32::MAX, 1).unwrap().len(), 1);
+    assert!(build_inputs_instance(1, 0).is_err());
+    assert!(build_inputs_instance(1, u32::MAX as usize + 1).is_err());
+  }
+
+  /// The aggregate KAT gate, every step in Zinc's `poseidon2::kat::gate`
+  /// order with its own failure message: (1) the fixture digest, (2) the
+  /// matrices and all 240 round constants, (3) the standalone
+  /// `permute([1, 2, 3])` outputs, (4) the messages and the chains
+  /// `h_1..h_10`, and (5) the three digests produced by `compute_advice`
+  /// at `H = 10`. The runner executes exactly this test.
+  #[test]
+  fn kat_gate() {
+    let bytes = std::fs::read(crate_path(KAT_FIXTURE_PATH)).expect("KAT fixture readable");
+    assert_eq!(
+      sha256_hex(&bytes),
+      KAT_FIXTURE_SHA256,
+      "step 1: fixture SHA-256"
+    );
+    let j: serde_json::Value = serde_json::from_slice(&bytes).expect("fixture parses");
+    let set = build_all_params().expect("parameters build");
+    let messages = build_inputs(KAT_HASHES_PER_FIELD).expect("messages build");
+    let standalone_input: [BigUint; 3] = [1u32, 2, 3].map(BigUint::from);
+    let mut constants = 0usize;
+    for field in FIELD_ORDER {
+      let name = field.name();
+      let params = set.get(field);
+      let entry = &j["fields"][name];
+      assert!(!entry.is_null(), "fixture has field {name}");
+      assert_eq!(matrix(&entry["m_e"]), M_E, "step 2: M_E for {name}");
+      assert_eq!(matrix(&entry["m_i"]), M_I, "step 2: M_I for {name}");
+      let flat: Vec<BigUint> = params.rc.iter().flatten().cloned().collect();
+      assert_eq!(
+        hex_array(&entry["round_constants"]),
+        flat,
+        "step 2: round constants of {name}"
+      );
+      constants += flat.len();
+      assert_eq!(
+        hex_array(&entry["standalone_input"]),
+        standalone_input.to_vec(),
+        "step 3: standalone input for {name}"
+      );
+      assert_eq!(
+        permute(params, standalone_input.clone())
+          .expect("permute")
+          .to_vec(),
+        hex_array(&entry["standalone_output"]),
+        "step 3: permute([1,2,3]) for {name}"
+      );
+      assert_eq!(
+        hex_array(&entry["messages"]),
+        messages,
+        "step 4: messages for {name}"
+      );
+      assert_eq!(
+        expected_chain(params, &messages).expect("chain"),
+        hex_array(&entry["chain"]),
+        "step 4: chain for {name}"
+      );
+    }
+    assert_eq!(constants, 240, "step 2: 240 round constants in total");
+    let (_shape, layout) = build_shape::<ME>(&set, KAT_HASHES_PER_FIELD).expect("shape builds");
+    let (_w, _q, digests) = compute_advice(&set, &layout, &messages).expect("advice computes");
+    for (f, field) in FIELD_ORDER.iter().enumerate() {
+      let chain = hex_array(&j["fields"][field.name()]["chain"]);
+      assert_eq!(
+        digests[f],
+        chain[KAT_HASHES_PER_FIELD - 1],
+        "step 5: D_f for {}",
+        field.name()
+      );
+    }
+  }
+
+  /// The tuning-corpus gate: the tracked corpus hashes to
+  /// `TUNING_CORPUS_ID`, its header matches the compiled framing, every
+  /// instance `1..=9` is rederived by `build_inputs_instance`, and the
+  /// held-out instance 0 is absent (and differs from every tuning
+  /// instance). The runner executes exactly this test.
+  #[test]
+  fn tuning_corpus_gate() {
+    let bytes = std::fs::read(crate_path(TUNE_CORPUS_PATH)).expect("corpus readable");
+    assert_eq!(sha256_hex(&bytes), TUNING_CORPUS_ID, "corpus SHA-256");
+    let j: serde_json::Value = serde_json::from_slice(&bytes).expect("corpus parses");
+    assert_eq!(j["version"], 1, "corpus version");
+    assert_eq!(j["workload"], "limber-poseidon2-v1", "corpus workload");
+    assert_eq!(
+      j["msg_instance_domain"].as_str(),
+      std::str::from_utf8(MSG_INSTANCE_DOMAIN).ok(),
+      "corpus instance domain"
+    );
+    assert_eq!(
+      j["message_bits"],
+      u64::from(MESSAGE_BITS),
+      "corpus message bits"
+    );
+    assert_eq!(j["message_index_base"], 1, "corpus message index base");
+    assert_eq!(
+      j["hashes_per_field"], KAT_HASHES_PER_FIELD as u64,
+      "corpus hashes per field"
+    );
+    let instances = j["instances"].as_array().expect("instances array");
+    assert_eq!(instances.len(), TUNING_INSTANCES.len(), "instance count");
+    for (entry, k) in instances.iter().zip(TUNING_INSTANCES) {
+      assert_eq!(entry["instance"], u64::from(k), "instance order");
+      assert_eq!(
+        hex_array(&entry["messages"]),
+        build_inputs_instance(k, KAT_HASHES_PER_FIELD).expect("messages build"),
+        "messages of instance {k}"
+      );
+    }
+    // Instance 0 is held out: absent from the corpus and distinct from
+    // every tuning instance's messages.
+    let inst0 = build_inputs(KAT_HASHES_PER_FIELD).expect("instance 0");
+    for entry in instances {
+      assert_ne!(entry["instance"], 0, "instance 0 must be held out");
+      assert_ne!(
+        hex_array(&entry["messages"]),
+        inst0,
+        "instance 0 messages in corpus"
+      );
+    }
+    for k in TUNING_INSTANCES {
+      assert_ne!(
+        inst0,
+        build_inputs_instance(k, KAT_HASHES_PER_FIELD).expect("messages build"),
+        "instance {k} equals the held-out instance 0"
+      );
     }
   }
 }
