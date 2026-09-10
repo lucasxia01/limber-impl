@@ -2,6 +2,7 @@
 name = "limber"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97"
 description = "SNARKs for integer Mod-R1CS (per-constraint moduli), built on Spartan's sum-check pipeline"
 readme = "README.md"
 repository = "https://github.com/j-cqy/limber-impl"
@@ -11,6 +12,8 @@ keywords = ["zkSNARKs", "cryptography", "proofs"]
 [dependencies]
 bellpepper-core = "0.4.0"
 bellpepper = "0.4.0"
+bellpepper-emulated = { git = "https://github.com/argumentcomputer/bellpepper-gadgets", rev = "2f90c6b90402128dd06b44d5d7f4cf1d9785a1ed" }
+libc = "0.2"
 ff = { version = "0.13.0", features = ["derive"] }
 digest = "0.10"
 sha3 = "0.10"
@@ -89,6 +92,10 @@ harness = false
 
 [[bench]]
 name = "poseidon_modp"
+harness = false
+
+[[bench]]
+name = "poseidon_spartan"
 harness = false
 
 [profile.release]

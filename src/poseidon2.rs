@@ -102,7 +102,7 @@ impl Field {
   }
 
   /// The field's prime modulus.
-  fn modulus(&self) -> BigUint {
+  pub(crate) fn modulus(&self) -> BigUint {
     let hex: &[u8] = match self {
       Field::Bn254Fr => b"30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001",
       Field::Bls12381Fr => b"73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001",
@@ -134,12 +134,31 @@ impl Poseidon2Params {
   pub fn modulus(&self) -> &BigUint {
     &self.modulus
   }
+
+  /// The 80 round constants in round layout: `rc[r]` holds round `r + 1`'s
+  /// constants (three per full round, one per partial round). Crate-side
+  /// accessor for the classic-Spartan emulated circuit; keeps the fields
+  /// private per the modp plan.
+  pub(crate) fn round_constants(&self) -> &[Vec<BigUint>] {
+    &self.rc
+  }
+
+  /// The external (full-round) linear-layer matrix `M_E`.
+  pub(crate) fn m_e(&self) -> &[[u64; 3]; 3] {
+    &self.m_e
+  }
+
+  /// The internal (partial-round) linear-layer matrix `M_I`.
+  pub(crate) fn m_i(&self) -> &[[u64; 3]; 3] {
+    &self.m_i
+  }
 }
 
 /// Fixed-order parameters for all three field blocks. Fields and
 /// constructor are private: only [`build_all_params`] can create one, and
 /// it fills [`FIELD_ORDER`], so a caller cannot swap a modulus into another
 /// block while retaining a self-consistent but mislabeled circuit.
+#[derive(Clone)]
 pub struct Poseidon2ParamsSet {
   /// One parameter set per block, in [`FIELD_ORDER`].
   params: [Poseidon2Params; NUM_FIELDS],
@@ -280,7 +299,7 @@ fn checked_dims(
 
 /// The fixed public chain IV `h₀ = 2^64 + 0x9e3779b97f4a7c15`, embedded
 /// separately in each field block's `A` entries on the constant column.
-fn chain_iv() -> BigUint {
+pub(crate) fn chain_iv() -> BigUint {
   (BigUint::one() << 64u32) + BigUint::from(0x9e37_79b9_7f4a_7c15u64)
 }
 
@@ -343,7 +362,7 @@ fn derive_round_constants(p: &BigUint) -> Result<Vec<Vec<BigUint>>, SpartanError
 }
 
 /// Whether round `r` (1-based, `1..=64`) is a full (external) round.
-fn is_full_round(r: usize) -> bool {
+pub(crate) fn is_full_round(r: usize) -> bool {
   r <= R_F / 2 || r > R_F / 2 + R_P
 }
 

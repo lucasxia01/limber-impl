@@ -297,6 +297,101 @@ mod tests_relaxed_sample {
   }
 }
 
+#[cfg(test)]
+mod tests_multiply_vec_precommitted {
+  use super::*;
+  use crate::{provider::P256HyraxEngine, traits::Engine};
+  use ff::Field;
+
+  type S = <P256HyraxEngine as Engine>::Scalar;
+
+  /// A tiny split shape with `num_shared` shared variables, two rest
+  /// variables, one public value, and entries touching every column
+  /// region (shared when present, rest, constant, public).
+  fn tiny_split_shape(num_shared: usize) -> SplitR1CSShape<P256HyraxEngine> {
+    let one = S::ONE;
+    let num_rest = 2;
+    let num_public = 1;
+    let num_vars = num_shared + num_rest;
+    let cols = num_vars + 1 + num_public;
+    let const_col = num_vars;
+    let public_col = num_vars + 1;
+
+    let mut a: Vec<(usize, usize, S)> = Vec::new();
+    let mut b: Vec<(usize, usize, S)> = Vec::new();
+    let mut c: Vec<(usize, usize, S)> = Vec::new();
+    if num_shared > 0 {
+      // constraint 0: shared0 * shared1 = rest0
+      a.push((0, 0, one));
+      b.push((0, 1, one));
+      c.push((0, num_shared, one));
+    } else {
+      // constraint 0: rest0 * 1 = rest1
+      a.push((0, 0, one));
+      b.push((0, const_col, one));
+      c.push((0, 1, one));
+    }
+    // constraint 1: (rest0 + public) * 1 = rest1
+    a.push((1, num_shared, one));
+    a.push((1, public_col, one));
+    b.push((1, const_col, one));
+    c.push((1, num_shared + 1, one));
+
+    SplitR1CSShape::new(
+      2,
+      num_shared,
+      0,
+      num_rest,
+      num_public,
+      0,
+      SparseMatrix::new(&a, 2, cols),
+      SparseMatrix::new(&b, 2, cols),
+      SparseMatrix::new(&c, 2, cols),
+    )
+    .unwrap()
+  }
+
+  fn assert_equivalent(shape: &SplitR1CSShape<P256HyraxEngine>, z_cached: &[S]) {
+    let fast = shape.multiply_vec_precommitted(z_cached).unwrap();
+    // Reference: ordinary multiply_vec over the full-size z whose cached
+    // prefix is `z_cached` and everything else (rest, constant, public,
+    // challenges) is zero — exactly the partial product's definition.
+    let total = shape.num_shared + shape.num_precommitted + shape.num_rest + 1 + shape.num_public;
+    let mut z_full = vec![S::ZERO; total];
+    z_full[..z_cached.len()].copy_from_slice(z_cached);
+    let reference = shape.multiply_vec(&z_full).unwrap();
+    assert_eq!(fast, reference);
+  }
+
+  /// The empty-prefix fast path returns exactly what the full traversal
+  /// returns for an all-zero cached prefix: three zero vectors of the
+  /// padded constraint count.
+  #[test]
+  fn test_multiply_vec_precommitted_empty_prefix() {
+    let shape = tiny_split_shape(0);
+    assert_eq!(shape.num_shared + shape.num_precommitted, 0);
+    assert_equivalent(&shape, &[]);
+    let (az, bz, cz) = shape.multiply_vec_precommitted(&[]).unwrap();
+    assert_eq!(az, vec![S::ZERO; shape.num_cons]);
+    assert_eq!(bz, vec![S::ZERO; shape.num_cons]);
+    assert_eq!(cz, vec![S::ZERO; shape.num_cons]);
+  }
+
+  /// A nonempty cached prefix keeps the existing behavior.
+  #[test]
+  fn test_multiply_vec_precommitted_nonempty_prefix() {
+    let shape = tiny_split_shape(2);
+    let cached_len = shape.num_shared + shape.num_precommitted;
+    assert!(cached_len > 0);
+    let mut z_cached = vec![S::ZERO; cached_len];
+    z_cached[0] = S::from(3u64);
+    z_cached[1] = S::from(5u64);
+    assert_equivalent(&shape, &z_cached);
+    let (az, _bz, _cz) = shape.multiply_vec_precommitted(&z_cached).unwrap();
+    assert!(az.iter().any(|v| *v != S::ZERO), "product must be nonzero");
+  }
+}
+
 /// Round `n` up to the next multiple of width.
 /// (If `n` is already a multiple and higher than zero, it is returned unchanged.)
 #[inline]
@@ -1119,6 +1214,17 @@ impl<E: Engine> SplitR1CSShape<E> {
       "multiply_vec_precommitted expects shared + precommitted ({cached_len}), got {}",
       z_cached.len()
     );
+    // Empty cached prefix: every input to the partial product is zero, so
+    // the result is three zero vectors. Skip building the full-size `z`
+    // and the complete A/B/C traversal — for circuits with no shared or
+    // precommitted variables this whole product is a no-op that would
+    // otherwise cost a full sparse-matrix pass inside `prep_prove`.
+    // Equivalence with `multiply_vec` on an all-zero `z` is pinned by
+    // `test_multiply_vec_precommitted_empty_prefix`.
+    if cached_len == 0 {
+      let zero = vec![E::Scalar::ZERO; self.num_cons];
+      return Ok((zero.clone(), zero.clone(), zero));
+    }
     // Build a full-size z vector with shared + precommitted values at correct positions
     let total_len = cached_len + self.num_rest + 1 + self.num_public + self.num_challenges;
     let mut z_full = vec![E::Scalar::ZERO; total_len];

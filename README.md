@@ -64,7 +64,9 @@ Larger $k$ lowers the commitment overhead at the cost of more CRT primes. See th
 
 ## Building and testing
 
-Requires a stable Rust toolchain (edition 2024, so Rust 1.85 or newer).
+Requires a stable Rust toolchain, **1.97 or newer** (declared as
+`rust-version` in `Cargo.toml`, so an older cargo reports the requirement
+instead of failing with confusing compile errors).
 
 ```bash
 cargo build --release

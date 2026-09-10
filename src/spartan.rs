@@ -70,6 +70,15 @@ pub struct SpartanVerifierKey<E: Engine> {
   digest: OnceCell<SpartanDigest>,
 }
 
+impl<E: Engine> SpartanVerifierKey<E> {
+  /// Returns sizes associated with the `SplitR1CSShape`, in the same layout
+  /// as [`SpartanProverKey::sizes`]. Crate-side only: used by typed
+  /// verifier-key wrappers to bind recorded metadata to the raw key.
+  pub(crate) fn sizes(&self) -> [usize; 10] {
+    self.S.sizes()
+  }
+}
+
 impl<E: Engine> crate::digest::Digestible for SpartanVerifierKey<E> {
   fn write_bytes<W: Sized + std::io::Write>(&self, w: &mut W) -> Result<(), std::io::Error> {
     use bincode::Options;
@@ -136,6 +145,70 @@ pub struct SpartanSNARK<E: Engine> {
   eval_W: E::Scalar,
   blind_eval_W: Blind<E>, // it is okay to send the blind since we are targeting non-zk
   eval_arg: <E::PCS as PCSEngineTrait<E>>::EvaluationArgument,
+}
+
+/// Measured canonical-bincode sizes of one [`SpartanSNARK`]'s components.
+/// Component sizes come from serializing the components with the crate's
+/// canonical bincode configuration, never from analytical formulas; the
+/// five non-derived components sum exactly to `wire_total`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpartanProofSizes {
+  /// The instance's three stored commitment fields, including both
+  /// `Option` discriminants.
+  pub instance_commitments: usize,
+  /// The instance's challenge vector, including its length prefix.
+  pub protocol_challenges: usize,
+  /// The instance's public-value vector, including its length prefix.
+  pub public_values: usize,
+  /// Outer sumcheck proof, outer claims, and inner sumcheck proof.
+  pub sumchecks_and_claims: usize,
+  /// `eval_W`, its blind, and the PCS evaluation argument.
+  pub evaluation_opening: usize,
+  /// `wire_total − public_values`: the payload used for cross-system
+  /// comparisons, which exclude statement data by convention.
+  pub comparison_payload: usize,
+  /// The complete serialized `SpartanSNARK`.
+  pub wire_total: usize,
+}
+
+impl<E: Engine> SpartanSNARK<E> {
+  /// Measure the canonical serialized size of every proof component
+  /// (see [`SpartanProofSizes`]). Every serialization error propagates.
+  pub fn component_sizes(&self) -> Result<SpartanProofSizes, SpartanError> {
+    use crate::imod_spartan_modp::to_canonical_bytes;
+    let instance_commitments = to_canonical_bytes(&(
+      &self.U.comm_W_shared,
+      &self.U.comm_W_precommitted,
+      &self.U.comm_W_rest,
+    ))?
+    .len();
+    let protocol_challenges = to_canonical_bytes(&self.U.challenges)?.len();
+    let public_values = to_canonical_bytes(&self.U.public_values)?.len();
+    let sumchecks_and_claims = to_canonical_bytes(&(
+      &self.sc_proof_outer,
+      &self.claims_outer,
+      &self.sc_proof_inner,
+    ))?
+    .len();
+    let evaluation_opening =
+      to_canonical_bytes(&(&self.eval_W, &self.blind_eval_W, &self.eval_arg))?.len();
+    let wire_total = to_canonical_bytes(self)?.len();
+    let comparison_payload =
+      wire_total
+        .checked_sub(public_values)
+        .ok_or_else(|| SpartanError::SerializationError {
+          reason: "proof-size accounting underflow: public values exceed wire total".to_string(),
+        })?;
+    Ok(SpartanProofSizes {
+      instance_commitments,
+      protocol_challenges,
+      public_values,
+      sumchecks_and_claims,
+      evaluation_opening,
+      comparison_payload,
+      wire_total,
+    })
+  }
 }
 
 impl<E: Engine> R1CSSNARKTrait<E> for SpartanSNARK<E> {

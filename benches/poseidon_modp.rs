@@ -32,7 +32,7 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = tikv_jemallocator::Jemalloc;
 
-use criterion::{BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, SamplingMode};
 use limber::{
   errors::SpartanError,
   imod_r1cs_modp::{IntModR1CSInstanceModp, IntModR1CSShapeModp, IntModR1CSWitnessModp},
@@ -124,13 +124,8 @@ struct Fixture<B: PoseidonBackend> {
   set: Poseidon2ParamsSet,
   shape: IntModR1CSShapeModp<B>,
   layout: Layout,
-  ie_params: IntEvalParams,
   messages: Vec<BigUint>,
-  w: Vec<BigUint>,
-  q: Vec<BigUint>,
-  digests: [BigUint; 3],
   pk: IntModSpartanModpProverKey<B>,
-  pvk: PoseidonVerifierKey<B>,
   instance: IntModR1CSInstanceModp<B>,
   proof: IntModSpartanModpSNARK<B>,
 }
@@ -178,7 +173,26 @@ fn print_proof_size_block<B: PoseidonBackend>(fx: &Fixture<B>, lines: &ProofSize
 /// one `validate_advice` over the combined advice), the Brakedown
 /// internal-layout warm-up, and the proof-size lines; after this, no
 /// reference comparison happens anywhere in the bench.
-fn build_fixture<B: PoseidonBackend>(hashes_per_field: usize, k: usize) -> Fixture<B> {
+/// Keyless workload fixture for the paired normal-mode groups: everything
+/// the `setup` group needs, with no proving key, verifier key, or proof
+/// coexisting (the spartan plan's §6 fixture lifetime order, applied to
+/// the paired ModP-Hyrax groups). The builder runs the complete untimed
+/// preflight — advice validation, reference-chain gate, one combined proof
+/// and verification — and DROPS every key/proof allocation before
+/// returning; the proof also warms Brakedown's internal layouts (global
+/// state, unaffected by the drop).
+struct WorkloadFixture<B: PoseidonBackend> {
+  set: Poseidon2ParamsSet,
+  shape: IntModR1CSShapeModp<B>,
+  layout: Layout,
+  ie_params: IntEvalParams,
+  messages: Vec<BigUint>,
+  w: Vec<BigUint>,
+  q: Vec<BigUint>,
+  digests: [BigUint; 3],
+}
+
+fn build_workload<B: PoseidonBackend>(hashes_per_field: usize, k: usize) -> WorkloadFixture<B> {
   let set = build_all_params().expect("params build");
   let (shape, layout) = build_shape::<B>(&set, hashes_per_field).expect("shape build");
   let messages = build_inputs(hashes_per_field).expect("inputs build");
@@ -205,15 +219,20 @@ fn build_fixture<B: PoseidonBackend>(hashes_per_field: usize, k: usize) -> Fixtu
     let len = f_chunk_len(&ie_params, n).expect("validated params");
     let _ = prewarm_brakedown_params(len);
   }
-  let (pk, vk) = B::setup_with_params(shape.clone(), ie_params.clone()).expect("backend setup");
-  let pvk = PoseidonVerifierKey::new(vk, &set, &layout).expect("verifier-key predicates");
-  let (witness, instance) =
-    IntModR1CSWitnessModp::<B>::new(&shape, pk.ck(), w.clone(), q.clone(), digests.to_vec())
-      .expect("witness commit");
-  let proof = IntModSpartanModpSNARK::<B>::prove(&pk, &instance, &witness).expect("prove");
-  verify_poseidon_chain(&pvk, &instance, &proof).expect("preflight verification");
+  {
+    // Untimed preflight proof + verification; all keys and the proof are
+    // dropped at the end of this block.
+    let (pk, vk) = B::setup_with_params(shape.clone(), ie_params.clone()).expect("backend setup");
+    let pvk = PoseidonVerifierKey::new(vk, &set, &layout).expect("verifier-key predicates");
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<B>::new(&shape, pk.ck(), w.clone(), q.clone(), digests.to_vec())
+        .expect("witness commit");
+    let proof = IntModSpartanModpSNARK::<B>::prove(&pk, &instance, &witness).expect("prove");
+    verify_poseidon_chain(&pvk, &instance, &proof).expect("preflight verification");
+    drop(witness);
+  }
 
-  Fixture {
+  WorkloadFixture {
     set,
     shape,
     layout,
@@ -222,8 +241,30 @@ fn build_fixture<B: PoseidonBackend>(hashes_per_field: usize, k: usize) -> Fixtu
     w,
     q,
     digests,
+  }
+}
+
+fn build_fixture<B: PoseidonBackend>(hashes_per_field: usize, k: usize) -> Fixture<B> {
+  let wf = build_workload::<B>(hashes_per_field, k);
+  let (pk, _vk) =
+    B::setup_with_params(wf.shape.clone(), wf.ie_params.clone()).expect("backend setup");
+  let (witness, instance) = IntModR1CSWitnessModp::<B>::new(
+    &wf.shape,
+    pk.ck(),
+    wf.w.clone(),
+    wf.q.clone(),
+    wf.digests.to_vec(),
+  )
+  .expect("witness commit");
+  let proof = IntModSpartanModpSNARK::<B>::prove(&pk, &instance, &witness).expect("prove");
+  drop(witness);
+
+  Fixture {
+    set: wf.set,
+    shape: wf.shape,
+    layout: wf.layout,
+    messages: wf.messages,
     pk,
-    pvk,
     instance,
     proof,
   }
@@ -328,25 +369,36 @@ fn bench_id(backend: Option<&str>, layout: &Layout, k: usize, config12: &str) ->
 /// The normal-mode groups for one backend, in the pinned literal order
 /// `[setup, advice (Hyrax only), commit_witness, prove_after_input_commit,
 /// prove_e2e, verify]`; each group contains exactly one combined case.
+/// Fixture lifetime order (spartan plan §6, applied to the paired groups):
+/// `setup` runs with only the keyless workload fixture; the proving key is
+/// constructed after the setup group finishes; the verification fixture
+/// (instance + proof) is constructed only for `verify`, with the proving
+/// key dropped first. The paired `setup`/`prove_e2e`/`verify` groups run
+/// Flat and return their outputs so destruction is untimed; ModP-only
+/// diagnostics keep their existing configuration.
 fn run_normal<B: PoseidonBackend>(
   c: &mut Criterion,
   config: &RunConfig,
   managed: &Option<Managed>,
   config12: &str,
 ) {
-  let fx = build_fixture::<B>(config.hashes, config.k);
+  let wf = build_workload::<B>(config.hashes, config.k);
   let mut audit = serde_json::Map::new();
 
-  // setup/: raw setup_with_params + checked PoseidonVerifierKey::new.
+  // setup/: raw setup_with_params + checked PoseidonVerifierKey::new. No
+  // other key pair exists while this group runs; the constructed pair is
+  // returned so its destruction happens after the timer stops.
   {
     let mut g = c.benchmark_group("setup");
-    let id = bench_id(Some(B::NAME), &fx.layout, config.k, config12);
+    g.sampling_mode(SamplingMode::Flat);
+    let id = bench_id(Some(B::NAME), &wf.layout, config.k, config12);
     g.bench_function(&id, |b| {
       b.iter_batched(
-        || (fx.shape.clone(), fx.ie_params.clone()),
+        || (wf.shape.clone(), wf.ie_params.clone()),
         |(shape, ie)| {
-          let (_pk, vk) = B::setup_with_params(shape, ie).expect("setup");
-          let _pvk = PoseidonVerifierKey::new(vk, &fx.set, &fx.layout).expect("vk predicates");
+          let (pk, vk) = B::setup_with_params(shape, ie).expect("setup");
+          let pvk = PoseidonVerifierKey::new(vk, &wf.set, &wf.layout).expect("vk predicates");
+          (pk, pvk)
         },
         BatchSize::PerIteration,
       );
@@ -359,27 +411,37 @@ fn run_normal<B: PoseidonBackend>(
   // backend segment).
   if !B::USES_RETAINED_CACHE {
     let mut g = c.benchmark_group("advice");
-    let id = bench_id(None, &fx.layout, config.k, config12);
+    let id = bench_id(None, &wf.layout, config.k, config12);
     g.bench_function(&id, |b| {
       b.iter(|| {
-        let _ = compute_advice(&fx.set, &fx.layout, &fx.messages).expect("advice");
+        let _ = compute_advice(&wf.set, &wf.layout, &wf.messages).expect("advice");
       });
     });
     g.finish();
   }
 
+  // Proving fixture: the key pair is built only after the setup group
+  // finished, so setup timing never coexists with another shape-bearing
+  // key pair.
+  let (pk, pvk) = {
+    let (pk, vk) =
+      B::setup_with_params(wf.shape.clone(), wf.ie_params.clone()).expect("backend setup");
+    let pvk = PoseidonVerifierKey::new(vk, &wf.set, &wf.layout).expect("verifier-key predicates");
+    (pk, pvk)
+  };
+
   // commit_witness/: IntModR1CSWitnessModp::new for the combined W/Q
   // vectors, from a reset cache.
   {
     let mut g = c.benchmark_group("commit_witness");
-    let id = bench_id(Some(B::NAME), &fx.layout, config.k, config12);
+    let id = bench_id(Some(B::NAME), &wf.layout, config.k, config12);
     audit_group::<B>(managed, &mut audit, &format!("commit_witness/{id}"), || {
       let _ = IntModR1CSWitnessModp::<B>::new(
-        &fx.shape,
-        fx.pk.ck(),
-        fx.w.clone(),
-        fx.q.clone(),
-        fx.digests.to_vec(),
+        &wf.shape,
+        pk.ck(),
+        wf.w.clone(),
+        wf.q.clone(),
+        wf.digests.to_vec(),
       )
       .expect("commit");
     });
@@ -387,11 +449,9 @@ fn run_normal<B: PoseidonBackend>(
       b.iter_batched(
         || {
           maybe_reset::<B>();
-          (fx.w.clone(), fx.q.clone(), fx.digests.to_vec())
+          (wf.w.clone(), wf.q.clone(), wf.digests.to_vec())
         },
-        |(w, q, x)| {
-          let _ = IntModR1CSWitnessModp::<B>::new(&fx.shape, fx.pk.ck(), w, q, x).expect("commit");
-        },
+        |(w, q, x)| IntModR1CSWitnessModp::<B>::new(&wf.shape, pk.ck(), w, q, x).expect("commit"),
         BatchSize::PerIteration,
       );
     });
@@ -403,21 +463,21 @@ fn run_normal<B: PoseidonBackend>(
   // commitment eviction. Never described as "commit-free".
   {
     let mut g = c.benchmark_group("prove_after_input_commit");
-    let id = bench_id(Some(B::NAME), &fx.layout, config.k, config12);
+    let id = bench_id(Some(B::NAME), &wf.layout, config.k, config12);
     audit_group::<B>(
       managed,
       &mut audit,
       &format!("prove_after_input_commit/{id}"),
       || {
         let (witness, instance) = IntModR1CSWitnessModp::<B>::new(
-          &fx.shape,
-          fx.pk.ck(),
-          fx.w.clone(),
-          fx.q.clone(),
-          fx.digests.to_vec(),
+          &wf.shape,
+          pk.ck(),
+          wf.w.clone(),
+          wf.q.clone(),
+          wf.digests.to_vec(),
         )
         .expect("commit");
-        let _ = IntModSpartanModpSNARK::<B>::prove(&fx.pk, &instance, &witness).expect("prove");
+        let _ = IntModSpartanModpSNARK::<B>::prove(&pk, &instance, &witness).expect("prove");
       },
     );
     g.bench_function(&id, |b| {
@@ -425,16 +485,16 @@ fn run_normal<B: PoseidonBackend>(
         || {
           maybe_reset::<B>();
           IntModR1CSWitnessModp::<B>::new(
-            &fx.shape,
-            fx.pk.ck(),
-            fx.w.clone(),
-            fx.q.clone(),
-            fx.digests.to_vec(),
+            &wf.shape,
+            pk.ck(),
+            wf.w.clone(),
+            wf.q.clone(),
+            wf.digests.to_vec(),
           )
           .expect("commit")
         },
         |(witness, instance)| {
-          let _ = IntModSpartanModpSNARK::<B>::prove(&fx.pk, &instance, &witness).expect("prove");
+          let _ = IntModSpartanModpSNARK::<B>::prove(&pk, &instance, &witness).expect("prove");
         },
         BatchSize::PerIteration,
       );
@@ -443,30 +503,47 @@ fn run_normal<B: PoseidonBackend>(
   }
 
   // prove_e2e/: combined advice + commit + prove — quote this as
-  // "prover time".
+  // "prover time". The proof, witness, and instance are returned so their
+  // destruction happens after the timer stops.
   {
     let mut g = c.benchmark_group("prove_e2e");
-    let id = bench_id(Some(B::NAME), &fx.layout, config.k, config12);
+    g.sampling_mode(SamplingMode::Flat);
+    let id = bench_id(Some(B::NAME), &wf.layout, config.k, config12);
     audit_group::<B>(managed, &mut audit, &format!("prove_e2e/{id}"), || {
-      prove_e2e_once(&fx);
+      let _out = prove_e2e_once(&wf.set, &wf.layout, &wf.messages, &wf.shape, &pk);
     });
     g.bench_function(&id, |b| {
       b.iter_batched(
         maybe_reset::<B>,
-        |()| prove_e2e_once(&fx),
+        |()| prove_e2e_once(&wf.set, &wf.layout, &wf.messages, &wf.shape, &pk),
         BatchSize::PerIteration,
       );
     });
     g.finish();
   }
 
+  // Verification fixture: one untimed instance + proof, created only for
+  // verify/; the proving key is dropped first.
+  let (witness, instance) = IntModR1CSWitnessModp::<B>::new(
+    &wf.shape,
+    pk.ck(),
+    wf.w.clone(),
+    wf.q.clone(),
+    wf.digests.to_vec(),
+  )
+  .expect("witness commit");
+  let proof = IntModSpartanModpSNARK::<B>::prove(&pk, &instance, &witness).expect("prove");
+  drop(witness);
+  drop(pk);
+
   // verify/: one verify_poseidon_chain, including all three canonicality
   // checks. No retained-cache access, nothing consumed.
   {
     let mut g = c.benchmark_group("verify");
-    let id = bench_id(Some(B::NAME), &fx.layout, config.k, config12);
+    g.sampling_mode(SamplingMode::Flat);
+    let id = bench_id(Some(B::NAME), &wf.layout, config.k, config12);
     g.bench_function(&id, |b| {
-      b.iter(|| verify_poseidon_chain(&fx.pvk, &fx.instance, &fx.proof).expect("verify"));
+      b.iter(|| verify_poseidon_chain(&pvk, &instance, &proof).expect("verify"));
     });
     g.finish();
   }
@@ -482,11 +559,25 @@ fn run_normal<B: PoseidonBackend>(
 }
 
 /// The timed `prove_e2e` region: combined advice + W/Q commit + prove.
-fn prove_e2e_once<B: PoseidonBackend>(fx: &Fixture<B>) {
-  let (w, q, digests) = compute_advice(&fx.set, &fx.layout, &fx.messages).expect("advice");
+/// Returns the proof, witness, and instance so their destruction happens
+/// after Criterion stops the timer (the spartan plan's §6 output-lifecycle
+/// convention, applied to both suites before quoting ratios).
+fn prove_e2e_once<B: PoseidonBackend>(
+  set: &Poseidon2ParamsSet,
+  layout: &Layout,
+  messages: &[BigUint],
+  shape: &IntModR1CSShapeModp<B>,
+  pk: &IntModSpartanModpProverKey<B>,
+) -> (
+  IntModSpartanModpSNARK<B>,
+  IntModR1CSWitnessModp<B>,
+  IntModR1CSInstanceModp<B>,
+) {
+  let (w, q, digests) = compute_advice(set, layout, messages).expect("advice");
   let (witness, instance) =
-    IntModR1CSWitnessModp::<B>::new(&fx.shape, fx.pk.ck(), w, q, digests.to_vec()).expect("commit");
-  let _ = IntModSpartanModpSNARK::<B>::prove(&fx.pk, &instance, &witness).expect("prove");
+    IntModR1CSWitnessModp::<B>::new(shape, pk.ck(), w, q, digests.to_vec()).expect("commit");
+  let proof = IntModSpartanModpSNARK::<B>::prove(pk, &instance, &witness).expect("prove");
+  (proof, witness, instance)
 }
 
 /// KSWEEP mode: Criterion-only combined `prove_e2e` sweep at fixed
@@ -579,12 +670,12 @@ fn run_ksweep<B: PoseidonBackend>(
   for (k, fx) in &admissible {
     let id = bench_id(Some(B::NAME), &fx.layout, *k, config12);
     audit_group::<B>(managed, &mut audit, &format!("prove_e2e/{id}"), || {
-      prove_e2e_once(fx);
+      let _out = prove_e2e_once(&fx.set, &fx.layout, &fx.messages, &fx.shape, &fx.pk);
     });
     g.bench_function(&id, |b| {
       b.iter_batched(
         maybe_reset::<B>,
-        |()| prove_e2e_once(fx),
+        |()| prove_e2e_once(&fx.set, &fx.layout, &fx.messages, &fx.shape, &fx.pk),
         BatchSize::PerIteration,
       );
     });

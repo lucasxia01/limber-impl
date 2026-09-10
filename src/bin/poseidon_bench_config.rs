@@ -25,6 +25,11 @@
 #![allow(non_snake_case)]
 
 use limber::poseidon_bench::{RunConfig, canonical_json_bytes};
+use limber::poseidon2::build_all_params;
+use limber::poseidon2_spartan::{
+  SpartanRunRequest, build_circuit, hard_safety_precheck, resolve_spartan_run,
+};
+use limber::provider::T256HyraxEngine;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -81,12 +86,12 @@ fn locked_version(lock: &str, package: &str) -> Option<String> {
   None
 }
 
-fn gather(config: &RunConfig) -> Result<serde_json::Value, String> {
+fn gather(protocol: serde_json::Value, allow_dirty: bool) -> Result<serde_json::Value, String> {
   // Source state.
   let git_sha = run("git", &["rev-parse", "HEAD"])?.trim().to_string();
   let porcelain = run("git", &["status", "--porcelain"])?;
   let dirty = !porcelain.trim().is_empty();
-  if dirty && !config.allow_dirty {
+  if dirty && !allow_dirty {
     return Err(
       "working tree is dirty; canonical runs require a clean tree \
        (POSEIDON_ALLOW_DIRTY=1 permits a non-publishable exploratory run)"
@@ -180,7 +185,7 @@ fn gather(config: &RunConfig) -> Result<serde_json::Value, String> {
   };
 
   Ok(serde_json::json!({
-    "protocol": config.protocol_json(),
+    "protocol": protocol,
     "environment": {
       "git_sha": git_sha,
       "git_dirty": dirty,
@@ -206,17 +211,63 @@ fn gather(config: &RunConfig) -> Result<serde_json::Value, String> {
 }
 
 fn main() -> ExitCode {
-  let args: Vec<String> = std::env::args().skip(1).collect();
+  let mut args: Vec<String> = std::env::args().skip(1).collect();
   let env_map: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
 
-  let config = match RunConfig::parse(&env_map) {
-    Ok(c) => c,
-    Err(e) => {
-      eprintln!("poseidon_bench_config: {e}");
+  // Optional leading `--suite <modp|spartan>`; the default remains the
+  // ModP suite.
+  let suite = if args.first().map(String::as_str) == Some("--suite") {
+    if args.len() < 2 {
+      eprintln!("poseidon_bench_config: --suite requires a value (modp|spartan)");
+      return ExitCode::FAILURE;
+    }
+    let s = args[1].clone();
+    args.drain(0..2);
+    s
+  } else {
+    "modp".to_string()
+  };
+
+  let (protocol, allow_dirty) = match suite.as_str() {
+    "modp" => match RunConfig::parse(&env_map) {
+      Ok(c) => (c.protocol_json(), c.allow_dirty),
+      Err(e) => {
+        eprintln!("poseidon_bench_config: {e}");
+        return ExitCode::FAILURE;
+      }
+    },
+    "spartan" => {
+      // Two-stage lifecycle (spartan plan §6): pure request parse, stage-1
+      // hard-safety precheck, then ONE actual shape synthesis frozen into
+      // the immutable resolved config. The emitted protocol subsection —
+      // and hence the config hash — derives from the resolved config.
+      let resolved = (|| -> Result<_, String> {
+        use limber::bellpepper::{r1cs::SpartanShape, shape_cs::ShapeCS};
+        let request = SpartanRunRequest::parse(&env_map).map_err(|e| e.to_string())?;
+        hard_safety_precheck(request.hashes).map_err(|e| e.to_string())?;
+        let set = build_all_params().map_err(|e| e.to_string())?;
+        let circuit =
+          build_circuit::<T256HyraxEngine>(&set, request.hashes).map_err(|e| e.to_string())?;
+        let shape = ShapeCS::r1cs_shape(&circuit).map_err(|e| e.to_string())?;
+        resolve_spartan_run(request, &set, &shape).map_err(|e| e.to_string())
+      })();
+      match resolved {
+        Ok(r) => {
+          let allow_dirty = r.request.allow_dirty;
+          (r.protocol_json(), allow_dirty)
+        }
+        Err(e) => {
+          eprintln!("poseidon_bench_config: {e}");
+          return ExitCode::FAILURE;
+        }
+      }
+    }
+    other => {
+      eprintln!("poseidon_bench_config: unknown suite {other:?} (expected modp or spartan)");
       return ExitCode::FAILURE;
     }
   };
-  let doc = match gather(&config) {
+  let doc = match gather(protocol, allow_dirty) {
     Ok(d) => d,
     Err(e) => {
       eprintln!("poseidon_bench_config: {e}");
@@ -253,7 +304,10 @@ fn main() -> ExitCode {
       }
     }
     other => {
-      eprintln!("usage: poseidon_bench_config [--check <run-config.json>], got {other:?}");
+      eprintln!(
+        "usage: poseidon_bench_config [--suite <modp|spartan>] [--check <run-config.json>], \
+         got {other:?}"
+      );
       ExitCode::FAILURE
     }
   }

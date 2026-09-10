@@ -163,7 +163,7 @@ pub struct RunConfig {
   pub log_n: usize,
 }
 
-fn cfg_err(reason: impl Into<String>) -> SpartanError {
+pub(crate) fn cfg_err(reason: impl Into<String>) -> SpartanError {
   SpartanError::InvalidInputLength {
     reason: format!("poseidon bench config: {}", reason.into()),
   }
@@ -172,7 +172,7 @@ fn cfg_err(reason: impl Into<String>) -> SpartanError {
 /// Fetch a recognized, result-affecting environment value. Present
 /// non-Unicode values are rejected rather than platform-dependently
 /// encoded.
-fn get_unicode(
+pub(crate) fn get_unicode(
   env: &BTreeMap<OsString, OsString>,
   key: &str,
 ) -> Result<Option<String>, SpartanError> {
@@ -186,7 +186,10 @@ fn get_unicode(
 }
 
 /// Strict boolean flag: exactly `"0"` or `"1"`; anything else errors.
-fn parse_bool(env: &BTreeMap<OsString, OsString>, key: &str) -> Result<bool, SpartanError> {
+pub(crate) fn parse_bool(
+  env: &BTreeMap<OsString, OsString>,
+  key: &str,
+) -> Result<bool, SpartanError> {
   match get_unicode(env, key)?.as_deref() {
     None => Ok(false),
     Some("0") => Ok(false),
@@ -198,7 +201,7 @@ fn parse_bool(env: &BTreeMap<OsString, OsString>, key: &str) -> Result<bool, Spa
 }
 
 /// Numeric flag: `usize`, present-or-absent.
-fn parse_usize(
+pub(crate) fn parse_usize(
   env: &BTreeMap<OsString, OsString>,
   key: &str,
 ) -> Result<Option<usize>, SpartanError> {
@@ -211,7 +214,7 @@ fn parse_usize(
   }
 }
 
-fn is_present(env: &BTreeMap<OsString, OsString>, key: &str) -> bool {
+pub(crate) fn is_present(env: &BTreeMap<OsString, OsString>, key: &str) -> bool {
   env.contains_key(OsStr::new(key))
 }
 
@@ -421,6 +424,17 @@ impl RunConfig {
   /// resolved input. `serde_json`'s default `Map` is BTree-backed, so
   /// serialization is key-sorted and deterministic.
   pub fn protocol_json(&self) -> serde_json::Value {
+    // Shared semantic-workload digest (spartan plan §6/§11): both suites
+    // embed the same §3 workload descriptor hash so the cross-system
+    // publication gate can compare workloads exactly, not just by name.
+    let workload_digest: String = {
+      let set = crate::poseidon2::build_all_params().expect("workload params validate");
+      crate::poseidon2_spartan::snark::workload_digest(&set)
+        .expect("workload digest")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+    };
     let mut knobs = serde_json::Map::new();
     for (name, state) in &self.knobs {
       knobs.insert(
@@ -430,6 +444,7 @@ impl RunConfig {
     }
     serde_json::json!({
       "workload": "limber-poseidon2-v1",
+      "workload_digest": workload_digest,
       "circuit": "mixed3",
       "mode": self.mode.name(),
       "backend": self.backend.name(),

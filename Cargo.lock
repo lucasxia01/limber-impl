@@ -95,6 +95,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bellpepper-emulated"
+version = "0.2.0"
+source = "git+https://github.com/argumentcomputer/bellpepper-gadgets?rev=2f90c6b90402128dd06b44d5d7f4cf1d9785a1ed#2f90c6b90402128dd06b44d5d7f4cf1d9785a1ed"
+dependencies = [
+ "bellpepper-core",
+ "ff",
+ "num-bigint 0.4.6",
+ "num-traits",
+]
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -798,6 +809,7 @@ version = "0.1.0"
 dependencies = [
  "bellpepper",
  "bellpepper-core",
+ "bellpepper-emulated",
  "bincode",
  "bitvec",
  "blake3",
@@ -815,6 +827,7 @@ dependencies = [
  "halo2curves",
  "hex",
  "itertools 0.14.0",
+ "libc",
  "num-bigint 0.4.6",
  "num-integer",
  "num-traits",

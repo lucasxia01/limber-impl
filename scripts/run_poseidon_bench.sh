@@ -101,7 +101,7 @@ fi
 "$HELPER" --check "$RUN_DIR/run-config.json"
 
 python3 - "$RUN_DIR" <<'EOF'
-import json, sys
+import json, os, sys
 run_dir = sys.argv[1]
 with open(f"{run_dir}/run-config.json") as f:
     cfg = json.load(f)
@@ -123,6 +123,33 @@ else:
         for prefix in want:
             if not any(k.startswith(prefix) for k in audit):
                 raise SystemExit(f"cache-audit.json has no {prefix} entries")
+if mode == "normal":
+    # Observed Criterion contract on the PAIRED groups (spartan plan §6):
+    # Flat mode, exactly ten samples, equal iteration counts. ModP-only
+    # diagnostics (advice, commit_witness, prove_after_input_commit) stay
+    # outside this requirement.
+    observed = {}
+    for want in ("setup", "prove_e2e", "verify"):
+        sample_paths = []
+        for root, _dirs, files in os.walk(f"{run_dir}/criterion/{want}"):
+            if "sample.json" in files and root.endswith("new"):
+                sample_paths.append(os.path.join(root, "sample.json"))
+        if len(sample_paths) != 1:
+            raise SystemExit(f"{want}: expected one new/sample.json, got {len(sample_paths)}")
+        with open(sample_paths[0]) as f:
+            sample = json.load(f)
+        s_mode, iters = sample.get("sampling_mode"), sample.get("iters", [])
+        if s_mode != "Flat":
+            raise SystemExit(f"{want}: observed sampling mode {s_mode!r}, required Flat")
+        if len(iters) != 10:
+            raise SystemExit(f"{want}: observed {len(iters)} samples, required 10")
+        if len(set(iters)) != 1:
+            raise SystemExit(f"{want}: unequal iteration counts {iters}")
+        observed[want] = {"sampling_mode": s_mode, "samples": len(iters),
+                          "iters_per_sample": iters[0]}
+    with open(f"{run_dir}/criterion-observed.json", "w") as f:
+        json.dump(observed, f, indent=2, sort_keys=True)
+        f.write("\n")
 if mode == "ksweep":
     with open(f"{run_dir}/ksweep-metadata.json"):
         pass

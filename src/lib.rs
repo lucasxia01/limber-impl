@@ -68,6 +68,8 @@ pub mod multiswap; // OWWB20 MultiSwap statement: primitives and instance genera
 #[doc(hidden)] // bench/test support; not part of the supported API
 pub mod poseidon2;
 #[doc(hidden)] // bench/test support; not part of the supported API
+pub mod poseidon2_spartan;
+#[doc(hidden)] // bench/test support; not part of the supported API
 pub mod poseidon_bench;
 pub mod spartan; // Spartan without zero-knowledge
 
