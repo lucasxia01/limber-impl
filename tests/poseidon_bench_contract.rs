@@ -554,7 +554,7 @@ fn child_config_parser_binds_the_parent_and_coordinate() {
   );
   // A sweep coordinate needs a sweep parent and vice versa.
   let sweep_coord =
-    json!({ "kind": "sweep", "block": 3, "ordinal": 40, "candidate": 12, "instance": 4 });
+    json!({ "kind": "sweep", "block": 1, "ordinal": 7, "candidate": 9, "instance": 4 });
   let cc_sweep_on_normal = synthetic_child_config(&parent, sweep_coord.clone());
   assert_eq!(
     parse_child_config_value(&cc_sweep_on_normal, &compiled)
@@ -568,9 +568,9 @@ fn child_config_parser_binds_the_parent_and_coordinate() {
   assert_eq!(
     parsed.coordinate,
     Coordinate::Sweep {
-      block: 3,
-      ordinal: 40,
-      candidate: 12,
+      block: 1,
+      ordinal: 7,
+      candidate: 9,
       instance: 4
     }
   );
@@ -584,7 +584,7 @@ fn child_config_parser_binds_the_parent_and_coordinate() {
   );
   let mut cc_bad_inst = synthetic_child_config(
     &sweep_parent,
-    json!({ "kind": "sweep", "block": 0, "ordinal": 1, "candidate": 12, "instance": 0 }),
+    json!({ "kind": "sweep", "block": 0, "ordinal": 1, "candidate": 9, "instance": 0 }),
   );
   assert_eq!(
     parse_child_config_value(&cc_bad_inst, &compiled)
@@ -675,20 +675,21 @@ fn benchmark_coins_seed_matches_the_independent_blake3() {
     hex(&benchmark_coins_seed(BenchBackend::Brakedown, 3, 9)),
     "7ac3b4a40244d2dbd12184ae5b86e407e759c47a05cf45cfb86825ac9b7fffc4"
   );
-  // The bench derives the index from k's position in K_ORDER.
-  assert_eq!(K_ORDER[0], 10);
+  // The bench derives the index from k's position in K_ORDER (the single
+  // pinned candidate k = 9 has index 0).
+  assert_eq!(K_ORDER, [9]);
   assert_eq!(
-    benchmark_seed(BenchBackend::Hyrax, 10, 0),
+    benchmark_seed(BenchBackend::Hyrax, 9, 0),
     benchmark_coins_seed(BenchBackend::Hyrax, 0, 0)
   );
   assert_eq!(
     benchmark_seed(BenchBackend::Brakedown, 9, 9),
-    benchmark_coins_seed(BenchBackend::Brakedown, 3, 9)
+    benchmark_coins_seed(BenchBackend::Brakedown, 0, 9)
   );
   // ChaCha20Rng::from_seed is reproducible from the seed.
-  let mut a = benchmark_rng(BenchBackend::Hyrax, 10, 0);
+  let mut a = benchmark_rng(BenchBackend::Hyrax, 9, 0);
   let mut b = ChaCha20Rng::from_seed(benchmark_coins_seed(BenchBackend::Hyrax, 0, 0));
-  let mut c = benchmark_rng(BenchBackend::Hyrax, 10, 1);
+  let mut c = benchmark_rng(BenchBackend::Hyrax, 9, 1);
   let (x, y, z) = (a.next_u64(), b.next_u64(), c.next_u64());
   assert_eq!(x, y);
   assert_ne!(x, z);

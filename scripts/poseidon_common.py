@@ -137,7 +137,10 @@ BACKEND_TAGS = {"hyrax": 0, "brakedown": 1}
 VARIANTS = BACKENDS
 # TUNE-1 candidate parameter: the integer k in the pinned literal order (tuning protocol
 # `systems.limber.k_order`); simplicity order is ascending k.
-K_ORDER = (10, 7, 12, 9, 13, 8, 11)
+# Single-candidate TUNE-1 epoch (tuning-protocol-v2 `single_candidate_epoch`): the
+# pinned candidate order is just the persisted default k = 9; K_RANGE stays the
+# admissible range for IDs and configs.
+K_ORDER = (9,)
 K_RANGE = (7, 13)
 CANDIDATES = K_ORDER
 SIMPLICITY_ORDER = tuple(sorted(K_ORDER))

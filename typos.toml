@@ -1,4 +1,8 @@
 [default.extend-words]
+flate = "flate"
+# Author surname cited in the security-accounting theorem references.
+Bootle = "Bootle"
+thr = "thr"
 Groth = "Groth"
 # "IntEval" / "inteval" is the protocol name from §4 of the SNARKs-for-
 # Integers paper (Integer Evaluation), not a misspelling of "interval".
@@ -7,3 +11,7 @@ IntEval = "IntEval"
 # "MiMC" is the MiMC-7 hash function (Albrecht et al.), not a typo of "mimic".
 mimc = "mimc"
 MiMC = "MiMC"
+
+[default]
+# Run-config identifiers (`cfg-<12 hex>`) and hexadecimal digests are not words.
+extend-ignore-re = ["cfg-[0-9a-f]{12}", "0x[0-9a-fA-F]+", "\\b[0-9a-f]{40,64}\\b"]

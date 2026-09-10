@@ -122,7 +122,7 @@ pub mod ids {
   pub const TUNING_PROTOCOL_PATH: &str = "specs/poseidon/tuning-protocol-v2.json";
   /// SHA-256 of the exact bytes of [`TUNING_PROTOCOL_PATH`].
   pub const TUNING_PROTOCOL_ID: &str =
-    "2e09b0cafbf2b1f7752936499bbfa9aadcb4408a20713871475882559913bec9";
+    "645a7efa9c3cc707eaa2f33a4886416d26250544acd1f6b5fc7325e2a0519897";
   /// Path of the shared cross-system comparison schema, relative to the
   /// crate root.
   pub const COMPARISON_SCHEMA_PATH: &str = "specs/poseidon/comparison-schema-v2.json";
@@ -159,7 +159,7 @@ pub mod ids {
   /// The pinned TUNE-1 candidate order of `k` (the tuning protocol's
   /// `systems.limber.k_order`); a candidate's zero-based position here is
   /// its `candidate_index` in the benchmark-coins seed.
-  pub const K_ORDER: [usize; 7] = [10, 7, 12, 9, 13, 8, 11];
+  pub const K_ORDER: [usize; 1] = [9];
 }
 
 /// Target scalar field for the Poseidon2 workload.
