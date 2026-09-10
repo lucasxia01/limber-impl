@@ -46,10 +46,18 @@ pub const HARD_MAX_PADDED_DOMAIN: usize = 1 << 26;
 pub const HARD_MAX_EST_RSS_BYTES: u64 = 48 << 30;
 
 /// Version-controlled canonical ceilings for `H = 10` (stage 4 of the §4
-/// resource gate). `None` until the reviewed resource checkpoint pins
-/// them; while unset, managed timing/proof-size runs fail closed into the
-/// `resource_proposal`/`resource_checkpoint` roles.
-pub const CANONICAL_CEILINGS: Option<ResourceCeilings> = None;
+/// resource gate), pinned from the reviewed resource checkpoint of
+/// 2026-09-10 (run `20260910T025919Z-spartan-cfg-c23fa4b4d772`, commit
+/// `75bd5f4`): single-threaded native-flags stages measured
+/// setup 40.5 s / prove_e2e 73.2 s / verify 14.0 s at 2^24 with peak RSS
+/// 2.00 GiB, projecting ≈ 23.4 min of total Criterion wall. Ceilings carry
+/// ~2–4× margin; exceeding one fails the run-bound preflight closed and
+/// reopens resource review.
+pub const CANONICAL_CEILINGS: Option<ResourceCeilings> = Some(ResourceCeilings {
+  max_padded_domain: 1 << 24,
+  max_rss_bytes: 8 << 30,
+  max_projected_wall_s: 3600,
+});
 
 /// Reviewed resource ceilings for the canonical `H = 10` configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -567,27 +575,24 @@ mod tests {
   }
 
   #[test]
-  fn execution_roles_fail_closed_while_ceilings_unset() {
-    assert!(
-      CANONICAL_CEILINGS.is_none(),
-      "test written for unset ceilings"
-    );
-    // H = 10 without acknowledgment: proposal role, regardless of mode.
+  fn execution_roles_with_pinned_ceilings() {
+    // The ceilings were pinned by the 2026-09-10 checkpoint; the roles now
+    // route H = 10 straight to the measuring roles, and any acknowledgment
+    // is an error (it authorized only the first checkpoint while ceilings
+    // were unset).
+    let ceilings = CANONICAL_CEILINGS.expect("ceilings are pinned");
+    assert_eq!(ceilings.max_padded_domain, 1 << 24);
     let cfg = SpartanRunRequest::parse(&env(&CANON_ENV)).unwrap();
-    assert_eq!(
-      cfg.execution_role(None).unwrap(),
-      ExecutionRole::ResourceProposal
-    );
-    // Matching acknowledgment: checkpoint; mismatched: error.
+    assert_eq!(cfg.execution_role(None).unwrap(), ExecutionRole::Timing);
+    let mut with_psize: Vec<(&str, &str)> = CANON_ENV.to_vec();
+    with_psize.push(("PSIZE", "1"));
+    let cfg = SpartanRunRequest::parse(&env(&with_psize)).unwrap();
+    assert_eq!(cfg.execution_role(None).unwrap(), ExecutionRole::ProofSize);
     let ack = "b".repeat(64);
     let cfg = SpartanRunRequest::parse(&env(&[("POSEIDON_RESOURCE_ACK", &ack)])).unwrap();
-    assert_eq!(
-      cfg.execution_role(Some(true)).unwrap(),
-      ExecutionRole::ResourceCheckpoint
-    );
-    assert!(cfg.execution_role(Some(false)).is_err());
     assert!(cfg.execution_role(None).is_err());
-    // Non-canonical H: ordinary roles, and an acknowledgment is an error.
+    assert!(cfg.execution_role(Some(true)).is_err());
+    // Non-canonical H: ordinary roles, and an acknowledgment stays an error.
     let cfg = SpartanRunRequest::parse(&env(&[("HASHES", "1")])).unwrap();
     assert_eq!(cfg.execution_role(None).unwrap(), ExecutionRole::Timing);
     let cfg =
