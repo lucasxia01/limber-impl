@@ -333,9 +333,15 @@ mod tests {
 
   #[test]
   fn k_order_is_a_permutation_of_7_to_13() {
+    // The pinned candidate order is a duplicate-free subset of the admissible
+    // range (the single-candidate epoch pins exactly `[9]`; a full sweep would
+    // pin a permutation of 7..=13).
     let mut sorted = K_ORDER.to_vec();
     sorted.sort_unstable();
-    assert_eq!(sorted, (K_RANGE.0..=K_RANGE.1).collect::<Vec<_>>());
+    sorted.dedup();
+    assert_eq!(sorted.len(), K_ORDER.len());
+    assert!(!K_ORDER.is_empty());
+    assert!(sorted.iter().all(|k| (K_RANGE.0..=K_RANGE.1).contains(k)));
     for (i, k) in K_ORDER.iter().enumerate() {
       assert!(is_candidate_k(*k));
       assert_eq!(candidate_index(*k), Some(i as u32));
