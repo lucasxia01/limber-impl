@@ -32,6 +32,7 @@ use crate::{
   traits::PrimeFieldExt,
   traits::transcript::ByteTranscript,
 };
+use rand_core::CryptoRngCore;
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -300,8 +301,13 @@ pub trait CommitBackend: Sized + Send + Sync + 'static {
   type BatchOpenArg: Clone + core::fmt::Debug + Serialize + DeserializeOwned + Send + Sync;
 
   /// Fresh commitment randomness for an `n`-coefficient polynomial
-  /// (`()` for non-hiding backends).
-  fn blind(ck: &Self::Ck, n: usize) -> Self::Blind;
+  /// (`()` for non-hiding backends), drawn from `rng`.
+  fn blind_with_rng(ck: &Self::Ck, n: usize, rng: &mut dyn CryptoRngCore) -> Self::Blind;
+
+  /// [`Self::blind_with_rng`] from fresh OS-seeded randomness.
+  fn blind(ck: &Self::Ck, n: usize) -> Self::Blind {
+    Self::blind_with_rng(ck, n, &mut rand::thread_rng())
+  }
 
   /// Transcript representation of a commitment (`absorb`-equivalent).
   fn comm_transcript_bytes(comm: &Self::Comm) -> Vec<u8>;
@@ -332,12 +338,23 @@ pub trait CommitBackend: Sized + Send + Sync + 'static {
 
   /// Discharge every target's single-point evaluation claim against a
   /// shared sub-transcript (the claims and evals are already bound to it
-  /// by the claim-reduction phase).
+  /// by the claim-reduction phase), drawing every prover coin from `rng`
+  /// (Hyrax: the IPA masking vectors and blinds; Brakedown: none).
+  fn open_targets_with_rng(
+    ck: &Self::Ck,
+    targets: &[OpenTarget<'_, Self>],
+    sub: &mut impl ByteTranscript,
+    rng: &mut dyn CryptoRngCore,
+  ) -> Result<Self::BatchOpenArg, SpartanError>;
+
+  /// [`Self::open_targets_with_rng`] from fresh OS-seeded randomness.
   fn open_targets(
     ck: &Self::Ck,
     targets: &[OpenTarget<'_, Self>],
     sub: &mut impl ByteTranscript,
-  ) -> Result<Self::BatchOpenArg, SpartanError>;
+  ) -> Result<Self::BatchOpenArg, SpartanError> {
+    Self::open_targets_with_rng(ck, targets, sub, &mut rand::thread_rng())
+  }
 
   /// Verifier mirror of [`Self::open_targets`].
   fn verify_targets(
@@ -373,7 +390,11 @@ where
   type Data = BrakedownCommitData<SE::Scalar>;
   type BatchOpenArg = BdBatchOpenArg<SE::Scalar>;
 
-  fn blind(_ck: &Self::Ck, _n: usize) -> Self::Blind {}
+  /// Brakedown is non-hiding: the blind is a unit and the backend draws
+  /// no prover randomness anywhere (commitments and openings are
+  /// deterministic functions of the polynomial and the transcript), so
+  /// `rng` is never touched.
+  fn blind_with_rng(_ck: &Self::Ck, _n: usize, _rng: &mut dyn CryptoRngCore) -> Self::Blind {}
 
   fn comm_transcript_bytes(comm: &Self::Comm) -> Vec<u8> {
     comm.to_vec()
@@ -427,11 +448,13 @@ where
     Ok(data)
   }
 
-  fn open_targets(
+  fn open_targets_with_rng(
     _ck: &Self::Ck,
     targets: &[OpenTarget<'_, Self>],
     sub: &mut impl ByteTranscript,
+    _rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::BatchOpenArg, SpartanError> {
+    // No prover randomness: the tensor-IOPP opening is deterministic.
     // Small targets ship their polynomial directly. The rest: targets
     // whose layouts share a code (uniform row length) and whose points
     // share their column suffix form ONE group with ONE proximity row

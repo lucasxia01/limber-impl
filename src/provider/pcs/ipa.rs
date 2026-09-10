@@ -16,6 +16,7 @@ use crate::{
 };
 use core::fmt::Debug;
 use ff::Field;
+use rand_core::CryptoRngCore;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -122,7 +123,10 @@ where
     b"inner product argument (linear)"
   }
 
-  /// Proves the inner product argument
+  /// Proves the inner product argument. Every prover coin (the masking
+  /// vector `d` and the two argument blinds) is drawn from `rng`, so a
+  /// seeded generator yields a deterministic argument; production callers
+  /// pass `rand::thread_rng()`.
   pub fn prove(
     ck: &[<E::GE as DlogGroup>::AffineGroupElement],
     h: &E::GE,
@@ -131,19 +135,19 @@ where
     U: &InnerProductInstance<E>,
     W: &InnerProductWitness<E>,
     transcript: &mut impl ByteTranscript,
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self, SpartanError> {
     transcript.dom_sep(Self::protocol_name());
 
     // absorb the instance in the transcript
     transcript.absorb_bytes(b"U", &U.to_transcript_bytes());
 
-    // produce randomness for the proofs using fast CSPRNG
-    let mut rng = rand::thread_rng();
+    // produce randomness for the proofs from the caller's CSPRNG
     let d_vec = (0..U.b_vec.len())
-      .map(|_| E::Scalar::random(&mut rng))
+      .map(|_| E::Scalar::random(&mut *rng))
       .collect::<Vec<E::Scalar>>();
-    let r_delta = E::Scalar::random(&mut rng);
-    let r_beta = E::Scalar::random(&mut rng);
+    let r_delta = E::Scalar::random(&mut *rng);
+    let r_beta = E::Scalar::random(&mut *rng);
 
     let delta = E::GE::vartime_multiscalar_mul(&d_vec, &ck[0..d_vec.len()], true)? + *h * r_delta;
     let beta = E::GE::group(ck_c) * inner_product(&U.b_vec, &d_vec) + *h_c * r_beta;

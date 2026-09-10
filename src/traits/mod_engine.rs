@@ -48,6 +48,7 @@ use core::{
 };
 use ff::{Field, PrimeField};
 use num_bigint::BigUint;
+use rand_core::CryptoRngCore;
 use serde::{Deserialize, Serialize};
 
 /// An aligned block of witness indices `[start, start + 2^log_len)` whose
@@ -266,13 +267,18 @@ pub trait ModEngine: SumcheckEngine {
   fn bootstrap_params() -> <Self::Scalar as SumcheckField>::Params;
 
   /// Sample the runtime modulus context for `Self::Scalar` from a
-  /// `ByteTranscript`. For static-modulus fields, return the `Params`
-  /// default (`()`) and absorb/squeeze nothing. For dynamic-modulus
-  /// fields, run the actual rejection-sampling / primality-testing loop
-  /// that drives the verifier-sampled prime `p`.
+  /// `ByteTranscript` through the bounded, audited P0-D sampler
+  /// (`crate::prime_sampler::sample_prime_v1`, purpose `RuntimeP`, width
+  /// 128), appending exactly one record to `log`. Dynamic-modulus engines
+  /// verify the high 128 bits of the sampled `U256` are zero and narrow it
+  /// to `U128` before building `FixedMontyParams<2>`. A static-modulus
+  /// engine returns its default `Params` (`()`), squeezes nothing and
+  /// appends nothing to `log` — its driver schedule then counts zero
+  /// runtime invocations.
   fn sample_params<T: crate::traits::transcript::ByteTranscript>(
     transcript: &mut T,
-  ) -> <Self::Scalar as SumcheckField>::Params;
+    log: &mut crate::prime_sampler::PrimeAuditLog,
+  ) -> Result<<Self::Scalar as SumcheckField>::Params, SpartanError>;
 }
 
 /// PCS interface for committing polynomials whose evaluations come from a
@@ -330,12 +336,21 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   /// Default no-op; override to match `PCSEngineTrait::precompute_ck`.
   fn precompute_ck(_ck: &Self::CommitmentKey) {}
 
-  /// Sample a fresh blind suitable for committing a polynomial of length `n`.
+  /// Sample a fresh blind suitable for committing a polynomial of length
+  /// `n`, drawing its randomness from `rng` (a seeded generator gives a
+  /// deterministic blind: the benchmark-coins path).
   ///
-  /// Mirrors `PCSEngineTrait::blind` for engines that wrap a field
-  /// PCS. For future hash-based / non-hiding Mod-PCS impls, this can
-  /// return a unit-typed sentinel.
-  fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind;
+  /// Mirrors `PCSEngineTrait::blind_with_rng` for engines that wrap a
+  /// field PCS. Hash-based / non-hiding Mod-PCS impls return a unit-typed
+  /// sentinel and never touch `rng`.
+  fn blind_with_rng(ck: &Self::CommitmentKey, n: usize, rng: &mut dyn CryptoRngCore)
+  -> Self::Blind;
+
+  /// [`blind_with_rng`](Self::blind_with_rng) from fresh OS-seeded
+  /// randomness (the production constructor).
+  fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
+    Self::blind_with_rng(ck, n, &mut rand::thread_rng())
+  }
 
   /// Commit to an **integer-valued** polynomial. Each entry is a
   /// non-negative bounded integer in `BigUint` form — `p`-independent and
@@ -373,11 +388,40 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   fn prove(
     ck: &Self::CommitmentKey,
     transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
     comm: &Self::Commitment,
     poly: &[BigUint],
     blind: &Self::Blind,
     point: &[E::Scalar],
     eval: &BigUint,
+  ) -> Result<Self::EvaluationArgument, SpartanError> {
+    Self::prove_with_rng(
+      ck,
+      transcript,
+      log,
+      comm,
+      poly,
+      blind,
+      point,
+      eval,
+      &mut rand::thread_rng(),
+    )
+  }
+
+  /// [`prove`](Self::prove) drawing every prover coin (internal
+  /// commitment blinds, inner-product masking) from `rng`; transcript
+  /// challenges and the prime-sampler draws are unaffected.
+  #[allow(clippy::too_many_arguments)]
+  fn prove_with_rng(
+    ck: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
+    comm: &Self::Commitment,
+    poly: &[BigUint],
+    blind: &Self::Blind,
+    point: &[E::Scalar],
+    eval: &BigUint,
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::EvaluationArgument, SpartanError>;
 
   /// Verify a polynomial opening. `eval` is the canonical integer in
@@ -386,6 +430,7 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   fn verify(
     vk: &Self::VerifierKey,
     transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
     comm: &Self::Commitment,
     point: &[E::Scalar],
     eval: &BigUint,
@@ -405,12 +450,18 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   fn prove_batch(
     ck: &Self::CommitmentKey,
     transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
     comms: &[&Self::Commitment],
     polys: &[&[BigUint]],
     blinds: &[&Self::Blind],
     points: &[&[E::Scalar]],
     evals: &[&BigUint],
-  ) -> Result<Self::BatchEvaluationArgument, SpartanError>;
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    let empty: Vec<&[SmallValueBlock]> = vec![&[]; polys.len()];
+    Self::prove_batch_with_blocks(
+      ck, transcript, log, comms, polys, blinds, points, evals, &empty,
+    )
+  }
 
   /// Verify a batched opening produced by [`prove_batch`](Self::prove_batch).
   /// `comms`, `points`, and `evals` mirror the prover's inputs in the
@@ -418,6 +469,7 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   fn verify_batch(
     vk: &Self::VerifierKey,
     transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
     comms: &[&Self::Commitment],
     points: &[&[E::Scalar]],
     evals: &[&BigUint],
@@ -426,12 +478,14 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
 
   /// [`prove_batch`](Self::prove_batch) plus per-polynomial
   /// [`SmallValueBlock`] assertions: `blocks[i]` lists the blocks of
-  /// `polys[i]` whose values are asserted `< 2^16`. The default only
-  /// supports the trivial (all-empty) case.
+  /// `polys[i]` whose values are asserted `< 2^16`. Draws its prover
+  /// coins from the thread RNG; see
+  /// [`prove_batch_with_blocks_rng`](Self::prove_batch_with_blocks_rng).
   #[allow(clippy::too_many_arguments)]
   fn prove_batch_with_blocks(
     ck: &Self::CommitmentKey,
     transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
     comms: &[&Self::Commitment],
     polys: &[&[BigUint]],
     blinds: &[&Self::Blind],
@@ -439,19 +493,43 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
     evals: &[&BigUint],
     blocks: &[&[SmallValueBlock]],
   ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
-    if blocks.iter().any(|b| !b.is_empty()) {
-      return Err(SpartanError::InternalError {
-        reason: "this Mod-PCS does not support small-value blocks".to_string(),
-      });
-    }
-    Self::prove_batch(ck, transcript, comms, polys, blinds, points, evals)
+    Self::prove_batch_with_blocks_rng(
+      ck,
+      transcript,
+      log,
+      comms,
+      polys,
+      blinds,
+      points,
+      evals,
+      blocks,
+      &mut rand::thread_rng(),
+    )
   }
+
+  /// [`prove_batch_with_blocks`](Self::prove_batch_with_blocks) drawing
+  /// every prover coin from `rng` (the required primitive every batched
+  /// prover path reduces to).
+  #[allow(clippy::too_many_arguments)]
+  fn prove_batch_with_blocks_rng(
+    ck: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[E::Scalar]],
+    evals: &[&BigUint],
+    blocks: &[&[SmallValueBlock]],
+    rng: &mut dyn CryptoRngCore,
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError>;
 
   /// Verify a [`prove_batch_with_blocks`](Self::prove_batch_with_blocks)
   /// argument; `blocks` mirrors the prover's declaration.
   fn verify_batch_with_blocks(
     vk: &Self::VerifierKey,
     transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
     comms: &[&Self::Commitment],
     points: &[&[E::Scalar]],
     evals: &[&BigUint],
@@ -463,7 +541,7 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
         reason: "this Mod-PCS does not support small-value blocks".to_string(),
       });
     }
-    Self::verify_batch(vk, transcript, comms, points, evals, arg)
+    Self::verify_batch(vk, transcript, log, comms, points, evals, arg)
   }
 
   /// Commit `v` as an integer polynomial whose values are bounded by
@@ -485,11 +563,43 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   /// polynomial `i` was committed at width `log_t_fs[i]` bits (its
   /// width-grouped segment bound). Every poly shares one range check and
   /// combined opening; the per-poly width only changes its own limb count.
-  /// The default is unsupported.
+  /// Draws its prover coins from the thread RNG; see
+  /// [`prove_batch_with_params_rng`](Self::prove_batch_with_params_rng).
   #[allow(clippy::too_many_arguments)]
   fn prove_batch_with_params(
+    ck: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[E::Scalar]],
+    evals: &[&BigUint],
+    blocks: &[&[SmallValueBlock]],
+    log_t_fs: &[usize],
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    Self::prove_batch_with_params_rng(
+      ck,
+      transcript,
+      log,
+      comms,
+      polys,
+      blinds,
+      points,
+      evals,
+      blocks,
+      log_t_fs,
+      &mut rand::thread_rng(),
+    )
+  }
+
+  /// [`prove_batch_with_params`](Self::prove_batch_with_params) drawing
+  /// every prover coin from `rng`. The default is unsupported.
+  #[allow(clippy::too_many_arguments)]
+  fn prove_batch_with_params_rng(
     _ck: &Self::CommitmentKey,
     _transcript: &mut E::TE,
+    _log: &mut crate::prime_sampler::PrimeAuditLog,
     _comms: &[&Self::Commitment],
     _polys: &[&[BigUint]],
     _blinds: &[&Self::Blind],
@@ -497,6 +607,7 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
     _evals: &[&BigUint],
     _blocks: &[&[SmallValueBlock]],
     _log_t_fs: &[usize],
+    _rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
     Err(SpartanError::InternalError {
       reason: "this Mod-PCS does not support width-grouped commitment".to_string(),
@@ -509,6 +620,7 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   fn verify_batch_with_params(
     _vk: &Self::VerifierKey,
     _transcript: &mut E::TE,
+    _log: &mut crate::prime_sampler::PrimeAuditLog,
     _comms: &[&Self::Commitment],
     _points: &[&[E::Scalar]],
     _evals: &[&BigUint],
@@ -520,6 +632,32 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
       reason: "this Mod-PCS does not support width-grouped commitment".to_string(),
     })
   }
+
+  /// Exact number of P0-D prime-sampler invocations
+  /// ([`prove`](Self::prove) / [`prove_batch`](Self::prove_batch) /
+  /// [`prove_batch_with_blocks`](Self::prove_batch_with_blocks) /
+  /// [`prove_batch_with_params`](Self::prove_batch_with_params)) perform
+  /// for `opening_count` openings under `ck`. `log_t_fs` is `None` for
+  /// the plain / blocks paths and the exact per-polynomial width slice
+  /// for `*_with_params`; a single [`prove`](Self::prove) uses
+  /// `opening_count = 1`. Implementations validate every slice length
+  /// and every `usize -> u16` sampler-width conversion first, then return
+  /// the checked sum in exact call order — before any transcript draw.
+  /// Blocks do not change the count.
+  fn prime_sampler_invocations_for_prove(
+    ck: &Self::CommitmentKey,
+    opening_count: usize,
+    log_t_fs: Option<&[usize]>,
+  ) -> Result<usize, SpartanError>;
+
+  /// Verifier-key mirror of
+  /// [`prime_sampler_invocations_for_prove`](Self::prime_sampler_invocations_for_prove);
+  /// the two agree for matching keys.
+  fn prime_sampler_invocations_for_verify(
+    vk: &Self::VerifierKey,
+    opening_count: usize,
+    log_t_fs: Option<&[usize]>,
+  ) -> Result<usize, SpartanError>;
 
   /// Whether the batch evaluation argument carries no sampled-prime
   /// (`E::Scalar`) data outside `expected` — the Mod-PCS counterpart of

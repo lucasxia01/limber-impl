@@ -5,6 +5,7 @@
 // Source repository: https://github.com/Microsoft/Spartan2
 
 //! This module defines errors returned by the library.
+use crate::prime_sampler::PrimeSamplerErrorKind;
 use core::fmt::Debug;
 use thiserror::Error;
 
@@ -115,6 +116,25 @@ pub enum SpartanError {
   #[error("SerializationError: {reason}")]
   SerializationError {
     /// The reason for the serialization failure
+    reason: String,
+  },
+  /// returned when the bounded transcript prime sampler fails closed; the
+  /// terminal audit record at `record_index` in the caller's
+  /// `PrimeAuditLog` carries the counters and rolling digest
+  #[error("PrimeSampler: {kind:?} (audit record {record_index})")]
+  PrimeSampler {
+    /// The fail-closed reason
+    kind: PrimeSamplerErrorKind,
+    /// Index of the terminal audit record of the failed invocation
+    record_index: usize,
+  },
+  /// returned when a prime-sampler invocation schedule is violated: a
+  /// count above the hard cap, an invocation beyond the scheduled count
+  /// (undercount) or a completed run with fewer records than scheduled
+  /// (overcount)
+  #[error("PrimeAuditLog: {reason}")]
+  PrimeAuditLog {
+    /// The reason for the schedule violation
     reason: String,
   },
 }

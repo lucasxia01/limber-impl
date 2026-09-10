@@ -23,6 +23,7 @@ use crate::{
 };
 use num_bigint::BigUint;
 use num_traits::Zero;
+use rand_core::{CryptoRng, CryptoRngCore, RngCore};
 use rayon::prelude::*;
 use tracing::info;
 
@@ -413,7 +414,9 @@ impl<M: ModEngine> IntModR1CSInstanceModp<M> {
 }
 
 impl<M: ModEngine> IntModR1CSWitnessModp<M> {
-  /// Commit to integer `(w, q)` and return the witness/instance pair.
+  /// Commit to integer `(w, q)` and return the witness/instance pair,
+  /// drawing the commitment blinds from fresh OS-seeded randomness (the
+  /// production constructor).
   pub fn new(
     shape: &IntModR1CSShapeModp<M>,
     ck: &ModCK<M>,
@@ -421,17 +424,34 @@ impl<M: ModEngine> IntModR1CSWitnessModp<M> {
     q: Vec<BigUint>,
     x: Vec<BigUint>,
   ) -> Result<(Self, IntModR1CSInstanceModp<M>), SpartanError> {
+    Self::new_with_rng(shape, ck, w, q, x, &mut rand::thread_rng())
+  }
+
+  /// [`new`](Self::new) drawing every commitment blind (`r_q` and the
+  /// per-segment `r_w`) from `rng`, in the fixed order `q` first, then
+  /// the witness segments in shape order. A seeded generator makes the
+  /// commitments deterministic (the benchmark-coins path); Brakedown
+  /// blinds are units and draw nothing.
+  pub fn new_with_rng(
+    shape: &IntModR1CSShapeModp<M>,
+    ck: &ModCK<M>,
+    w: Vec<BigUint>,
+    q: Vec<BigUint>,
+    x: Vec<BigUint>,
+    rng: &mut (impl RngCore + CryptoRng),
+  ) -> Result<(Self, IntModR1CSInstanceModp<M>), SpartanError> {
+    let rng: &mut dyn CryptoRngCore = rng;
     if w.len() != shape.num_vars || q.len() != shape.num_cons || x.len() != shape.num_io {
       return Err(SpartanError::InvalidWitnessLength);
     }
-    let r_q = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(ck, shape.num_cons);
+    let r_q = <ModPCS<M> as ModPCSEngineTrait<M>>::blind_with_rng(ck, shape.num_cons, rng);
     let (_wq_span, wq_t) = start_span!("imod_modp_wq_commit");
     // Witness commitment: one commitment per width-grouped segment (each at
     // its own value-width bound), or a single commitment over the whole
     // witness when the shape declares no segments.
     let segs = shape.width_segments();
     let (r_w, comm_w): (Vec<ModBlind<M>>, Vec<ModComm<M>>) = if segs.is_empty() {
-      let r = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(ck, shape.num_vars);
+      let r = <ModPCS<M> as ModPCSEngineTrait<M>>::blind_with_rng(ck, shape.num_vars, rng);
       let c = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &w, &r)?;
       (vec![r], vec![c])
     } else {
@@ -439,7 +459,7 @@ impl<M: ModEngine> IntModR1CSWitnessModp<M> {
       let mut cs = Vec::with_capacity(segs.len());
       for seg in segs {
         let slice = &w[seg.start..seg.start + seg.size()];
-        let r = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(ck, seg.size());
+        let r = <ModPCS<M> as ModPCSEngineTrait<M>>::blind_with_rng(ck, seg.size(), rng);
         let c = <ModPCS<M> as ModPCSEngineTrait<M>>::commit_at(ck, slice, &r, seg.log_t_f)?;
         rs.push(r);
         cs.push(c);

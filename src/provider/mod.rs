@@ -149,8 +149,9 @@ impl ModEngine for T256DynPrimeBdEngine {
 
   fn sample_params<T: crate::traits::transcript::ByteTranscript>(
     transcript: &mut T,
-  ) -> crypto_bigint::modular::FixedMontyParams<2> {
-    <T256DynPrimeEngine as ModEngine>::sample_params(transcript)
+    log: &mut crate::prime_sampler::PrimeAuditLog,
+  ) -> Result<crypto_bigint::modular::FixedMontyParams<2>, crate::errors::SpartanError> {
+    <T256DynPrimeEngine as ModEngine>::sample_params(transcript, log)
   }
 }
 
@@ -190,8 +191,9 @@ impl ModEngine for M127DynPrimeBdEngine {
 
   fn sample_params<T: crate::traits::transcript::ByteTranscript>(
     transcript: &mut T,
-  ) -> crypto_bigint::modular::FixedMontyParams<2> {
-    <T256DynPrimeEngine as ModEngine>::sample_params(transcript)
+    log: &mut crate::prime_sampler::PrimeAuditLog,
+  ) -> Result<crypto_bigint::modular::FixedMontyParams<2>, crate::errors::SpartanError> {
+    <T256DynPrimeEngine as ModEngine>::sample_params(transcript, log)
   }
 }
 
@@ -208,32 +210,45 @@ impl ModEngine for T256DynPrimeEngine {
     crypto_bigint::modular::FixedMontyParams::new(Odd::new(U128::from(3u32)).unwrap())
   }
 
-  /// Rejection-sample a ~128-bit prime `p` from the transcript via
-  /// Miller-Rabin + Lucas BPSW (`crypto_primes::is_prime`). Each
-  /// `squeeze_bytes` call advances the transcript identically on prover
-  /// and verifier sides, so both arrive at the same `p`.
+  /// Sample the ~128-bit runtime prime `p` from the transcript through
+  /// the bounded, audited P0-D sampler (`sample_prime_v1`, purpose
+  /// `RuntimeP`, width 128: forced top bit so `p` is exactly 128 bits,
+  /// forced low bit, BPSW'21 prefilter, 72 transcript-derived
+  /// Miller–Rabin rounds, fail-closed caps). Every candidate and base
+  /// draw advances the transcript identically on prover and verifier
+  /// sides, so both arrive at the same `p`; exactly one audit record is
+  /// appended to `log`.
   ///
-  /// The candidate is built by taking 16 bytes from the squeeze, forcing
-  /// the top bit (MSB of bit 127, exactly 128-bit width) and the bottom
-  /// bit (odd), then testing primality. The zero-padded `U256` carrier
-  /// type matches `DynPrime<2>`'s backing.
+  /// The sampler returns a `U256`; the high 128 bits are verified zero
+  /// and the value is narrowed to `U128` (the `DynPrime<2>` backing)
+  /// before `FixedMontyParams<2>` construction.
   fn sample_params<T: crate::traits::transcript::ByteTranscript>(
     transcript: &mut T,
-  ) -> crypto_bigint::modular::FixedMontyParams<2> {
+    log: &mut crate::prime_sampler::PrimeAuditLog,
+  ) -> Result<crypto_bigint::modular::FixedMontyParams<2>, crate::errors::SpartanError> {
+    use crate::{
+      errors::SpartanError,
+      prime_sampler::{PrimeSamplerPurpose, RUNTIME_P_WIDTH_BITS, sample_prime_v1},
+    };
     use crypto_bigint::{Odd, U128};
-    use crypto_primes::{Flavor, is_prime};
-    loop {
-      let bytes = transcript
-        .squeeze_bytes(b"sample_p")
-        .expect("transcript squeeze failed during prime sampling");
-      let mut candidate_bytes = [0u8; 16];
-      candidate_bytes.copy_from_slice(&bytes[..16]);
-      candidate_bytes[15] |= 0x80; // exactly 128-bit
-      candidate_bytes[0] |= 0x01; // odd
-      let candidate = U128::from_le_slice(&candidate_bytes);
-      if is_prime(Flavor::Any, &candidate) {
-        return crypto_bigint::modular::FixedMontyParams::new(Odd::new(candidate).unwrap());
-      }
+    let p = sample_prime_v1(
+      transcript,
+      PrimeSamplerPurpose::RuntimeP,
+      RUNTIME_P_WIDTH_BITS,
+      log,
+    )?;
+    let bytes = p.to_le_bytes();
+    if bytes[16..].iter().any(|b| *b != 0) {
+      return Err(SpartanError::InternalError {
+        reason: "runtime prime sampler returned a value above 128 bits".to_string(),
+      });
     }
+    let narrow = U128::from_le_slice(&bytes[..16]);
+    let odd = Odd::new(narrow)
+      .into_option()
+      .ok_or_else(|| SpartanError::InternalError {
+        reason: "runtime prime sampler returned an even value".to_string(),
+      })?;
+    Ok(crypto_bigint::modular::FixedMontyParams::new(odd))
   }
 }

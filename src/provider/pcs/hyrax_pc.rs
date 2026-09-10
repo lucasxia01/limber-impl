@@ -23,6 +23,7 @@ use crate::{
 use core::marker::PhantomData;
 use ff::{Field, PrimeField};
 use num_integer::div_ceil;
+use rand_core::CryptoRngCore;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -180,6 +181,7 @@ where
     mu: E::Scalar,
     comm_eval: &HyraxCommitment<E>,
     blind_eval: &HyraxBlind<E>,
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<HyraxEvaluationArgument<E>, SpartanError> {
     let num_cols = ck.num_cols;
     let col_vars = num_cols.log_2();
@@ -240,6 +242,7 @@ where
       &ipa_instance,
       &ipa_witness,
       transcript,
+      rng,
     )?;
     Ok(HyraxEvaluationArgument { ipa })
   }
@@ -368,14 +371,17 @@ where
     }
   }
 
-  fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
+  fn blind_with_rng(
+    ck: &Self::CommitmentKey,
+    n: usize,
+    rng: &mut dyn CryptoRngCore,
+  ) -> Self::Blind {
     use crate::traits::PrimeFieldExt;
-    let mut rng = rand::thread_rng();
     let num_rows = div_ceil(n, ck.num_cols);
 
     // Bulk random generation: fill all bytes at once, then reduce mod p
     let mut buf = vec![0u8; num_rows * 64];
-    rand::RngCore::fill_bytes(&mut rng, &mut buf);
+    rng.fill_bytes(&mut buf);
     HyraxBlind {
       blind: (0..num_rows)
         .map(|i| E::Scalar::from_uniform(&buf[i * 64..(i + 1) * 64]))
@@ -568,7 +574,7 @@ where
     Ok(HyraxBlind { blind: blinds_comb })
   }
 
-  fn prove(
+  fn prove_with_rng(
     ck: &Self::CommitmentKey,
     ck_eval: &Self::CommitmentKey,
     transcript: &mut impl ByteTranscript,
@@ -578,6 +584,7 @@ where
     point: &[E::Scalar],
     comm_eval: &Self::Commitment,
     blind_eval: &Self::Blind,
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let n = poly.len();
     let (_setup_span, setup_t) = start_span!("hyrax_prove_prep");
@@ -655,6 +662,7 @@ where
       &ipa_instance,
       &ipa_witness,
       transcript,
+      rng,
     )?;
     info!(elapsed_ms = %ipa_t.elapsed().as_millis(), "hyrax_prove_ipa");
 

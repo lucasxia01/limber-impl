@@ -15,6 +15,9 @@
 //! `s` independent primes implies the integer evaluation is correct
 //! with high probability.
 
+use crate::prime_sampler::{
+  PrimeAuditLog, PrimeSamplerPurpose, checked_schedule_add, sample_prime_v1, schedule_width_bits,
+};
 use crate::provider::pcs::commit_backend::{BdBackend, CommitBackend, OpenTarget};
 use crate::{
   errors::SpartanError,
@@ -38,6 +41,7 @@ use ff::{Field, PrimeField};
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, Zero};
+use rand_core::CryptoRngCore;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -1628,46 +1632,76 @@ fn integer_mle_evaluate(poly: &[BigUint], point: &[BigUint]) -> BigInt {
   cur.pop().expect("non-empty table")
 }
 
-/// Rejection-sample a small prime in `[2^{log_p - 1}, 2^{log_p})` from
-/// the transcript via Miller-Rabin / Lucas BPSW. Squeezes 64 bytes at a
-/// time, builds a `log_p`-bit candidate with the MSB and LSB forced,
-/// runs `crypto_primes::is_prime`, and retries on composite. The two
-/// sides (prover & verifier) drive the transcript identically, so they
-/// arrive at the same prime.
+/// Sample an IntEval small prime in `[2^{width_bits - 1}, 2^{width_bits})`
+/// from the transcript through the bounded, audited P0-D sampler
+/// (`sample_prime_v1`, purpose `IntEvalSmallP`). `width_bits` is the
+/// already-validated `u16` conversion of `IntEvalParams::log_p` (see
+/// [`ModPCSEngineTrait::prime_sampler_invocations_for_prove`]); exactly
+/// one record is appended to `log`, and the `U256` result is converted to
+/// `BigUint` only after success. Prover and verifier drive the transcript
+/// identically, so they arrive at the same prime.
 fn sample_small_prime<T: ByteTranscript>(
   transcript: &mut T,
-  log_p: usize,
+  width_bits: u16,
+  log: &mut PrimeAuditLog,
 ) -> Result<BigUint, SpartanError> {
-  use crypto_primes::{Flavor, is_prime};
-  // `crypto_primes::is_prime` works over `Uint<L>`; we use `U256` here
-  // since `log_p` is bounded by `LOG_Q = 256`.
-  use crypto_bigint::U256;
-  assert!(log_p > 1 && log_p <= LOG_Q);
-  let bytes_needed = log_p.div_ceil(8);
-  loop {
-    let bytes = transcript.squeeze_bytes(b"sample_small_p")?;
-    let mut buf = [0u8; 32];
-    buf[..bytes_needed].copy_from_slice(&bytes[..bytes_needed]);
-    // Force MSB of bit (log_p - 1) so candidate has exactly log_p bits;
-    // force LSB so it's odd. Clear bits above log_p - 1 so width is exact.
-    let top_byte = (log_p - 1) / 8;
-    let top_bit_in_byte = (log_p - 1) % 8;
-    // Clear bits above log_p - 1.
-    if top_byte < 32 {
-      let mask_top: u8 = (1u16 << (top_bit_in_byte + 1)).wrapping_sub(1) as u8;
-      buf[top_byte] &= mask_top;
-      for b in &mut buf[(top_byte + 1)..] {
-        *b = 0;
-      }
-    }
-    // Force MSB and LSB.
-    buf[top_byte] |= 1u8 << top_bit_in_byte;
-    buf[0] |= 0x01;
-    let candidate = U256::from_le_slice(&buf);
-    if is_prime(Flavor::Any, &candidate) {
-      return Ok(BigUint::from_bytes_le(&buf));
-    }
+  let p = sample_prime_v1(
+    transcript,
+    PrimeSamplerPurpose::IntEvalSmallP,
+    width_bits,
+    log,
+  )?;
+  Ok(BigUint::from_bytes_le(&p.to_le_bytes()))
+}
+
+/// Exact number of P0-D sampler invocations `opening_count` IntEval
+/// openings perform under `params`: the checked sum of the per-call
+/// (native or `narrowed`) `IntEvalParams::s` values in call order, after
+/// every slice length and every `log_p -> u16` width conversion has been
+/// validated. Shared by the prover- and verifier-key accessors of both
+/// Mod-PCS impls, so the two sides agree for matching keys.
+fn inteval_prime_invocations(
+  params: &IntEvalParams,
+  opening_count: usize,
+  log_t_fs: Option<&[usize]>,
+) -> Result<usize, SpartanError> {
+  if opening_count == 0 {
+    return Err(SpartanError::InternalError {
+      reason: "prime-sampler schedule: an IntEval opening batch is never empty".to_string(),
+    });
   }
+  let narrowed: Vec<IntEvalParams> = match log_t_fs {
+    None => Vec::new(),
+    Some(ltfs) => {
+      if ltfs.len() != opening_count {
+        return Err(SpartanError::InternalError {
+          reason: format!(
+            "prime-sampler schedule: {} segment widths for {opening_count} openings",
+            ltfs.len()
+          ),
+        });
+      }
+      ltfs
+        .iter()
+        .map(|&l| params.narrowed(l))
+        .collect::<Result<_, _>>()?
+    }
+  };
+  let per_call = |i: usize| -> &IntEvalParams {
+    if narrowed.is_empty() {
+      params
+    } else {
+      &narrowed[i]
+    }
+  };
+  for i in 0..opening_count {
+    schedule_width_bits(per_call(i).log_p)?;
+  }
+  let mut total = 0usize;
+  for i in 0..opening_count {
+    total = checked_schedule_add(total, per_call(i).s)?;
+  }
+  Ok(total)
 }
 
 /// Sound Mod-PCS for `T256DynPrimeEngine`. See module docs.
@@ -1809,7 +1843,11 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     Hyrax::precompute_ck(&ck.eval);
   }
 
-  fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
+  fn blind_with_rng(
+    ck: &Self::CommitmentKey,
+    n: usize,
+    rng: &mut dyn CryptoRngCore,
+  ) -> Self::Blind {
     // Documented caller contract for the infallible trait boundary: the
     // key was validated for `max_n`, and `f_chunk_len` is monotone in
     // `n`, so any `n <= max_n` has a valid inflated length. A caller
@@ -1829,7 +1867,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let inflated =
       f_chunk_len(&ck.params, n).expect("f_chunk_len validated for commitment-key capacity");
     IntegerModBlind {
-      inner: Hyrax::blind(&ck.inner, inflated),
+      inner: Hyrax::blind_with_rng(&ck.inner, inflated, rng),
     }
   }
 
@@ -1890,18 +1928,36 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     vk.params.log_t_f
   }
 
-  fn prove(
+  fn prime_sampler_invocations_for_prove(
+    ck: &Self::CommitmentKey,
+    opening_count: usize,
+    log_t_fs: Option<&[usize]>,
+  ) -> Result<usize, SpartanError> {
+    inteval_prime_invocations(&ck.params, opening_count, log_t_fs)
+  }
+
+  fn prime_sampler_invocations_for_verify(
+    vk: &Self::VerifierKey,
+    opening_count: usize,
+    log_t_fs: Option<&[usize]>,
+  ) -> Result<usize, SpartanError> {
+    inteval_prime_invocations(&vk.params, opening_count, log_t_fs)
+  }
+
+  fn prove_with_rng(
     ck: &Self::CommitmentKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comm: &Self::Commitment,
     poly: &[BigUint],
     blind: &Self::Blind,
     point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
     eval: &BigUint,
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_prove");
     let mut st = prove_one_poly::<HyBackend, T256DynPrimeEngine>(
-      &ck.params, ck, transcript, poly, point, eval,
+      &ck.params, ck, transcript, log, poly, point, eval, rng,
     )?;
     let (range_check, combined_open, _) = finish_batch_open::<HyBackend, T256DynPrimeEngine>(
       &ck.params,
@@ -1911,6 +1967,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       &[&comm.inner],
       &[&blind.inner],
       &[&[]],
+      rng,
     )?;
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_prove");
     Ok(IntEvalArgument {
@@ -1923,30 +1980,17 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     })
   }
 
-  fn prove_batch(
+  fn prove_batch_with_blocks_rng(
     ck: &Self::CommitmentKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
-    comms: &[&Self::Commitment],
-    polys: &[&[BigUint]],
-    blinds: &[&Self::Blind],
-    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
-    evals: &[&BigUint],
-  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
-    let empty: Vec<&[SmallValueBlock]> = vec![&[]; polys.len()];
-    <Self as ModPCSEngineTrait<T256DynPrimeEngine>>::prove_batch_with_blocks(
-      ck, transcript, comms, polys, blinds, points, evals, &empty,
-    )
-  }
-
-  fn prove_batch_with_blocks(
-    ck: &Self::CommitmentKey,
-    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comms: &[&Self::Commitment],
     polys: &[&[BigUint]],
     blinds: &[&Self::Blind],
     points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
     blocks: &[&[SmallValueBlock]],
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_prove_batch");
     let n = polys.len();
@@ -1964,7 +2008,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let mut ph1s: Vec<ChainPhase1<HyBackend>> = Vec::with_capacity(n);
     for i in 0..n {
       ph1s.push(prove_one_poly_phase1::<HyBackend, T256DynPrimeEngine>(
-        &ck.params, ck, transcript, polys[i], points[i], evals[i],
+        &ck.params, ck, transcript, log, polys[i], points[i], evals[i], rng,
       )?);
     }
     let mut states: Vec<PerPolyProver<HyBackend>> = Vec::with_capacity(n);
@@ -1984,6 +2028,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         &comm_inners,
         &blind_inners,
         blocks,
+        rng,
       )?;
     let per_poly = states
       .into_iter()
@@ -2006,6 +2051,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
   fn verify(
     vk: &Self::VerifierKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comm: &Self::Commitment,
     point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
     eval: &BigUint,
@@ -2015,6 +2061,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let mut v = verify_one_poly::<HyBackend, T256DynPrimeEngine>(
       &vk.params,
       transcript,
+      log,
       point,
       eval,
       &arg.reduction_round_polys,
@@ -2041,6 +2088,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
   fn verify_batch(
     vk: &Self::VerifierKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comms: &[&Self::Commitment],
     points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
@@ -2048,13 +2096,14 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
   ) -> Result<(), SpartanError> {
     let empty: Vec<&[SmallValueBlock]> = vec![&[]; comms.len()];
     <Self as ModPCSEngineTrait<T256DynPrimeEngine>>::verify_batch_with_blocks(
-      vk, transcript, comms, points, evals, arg, &empty,
+      vk, transcript, log, comms, points, evals, arg, &empty,
     )
   }
 
   fn verify_batch_with_blocks(
     vk: &Self::VerifierKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comms: &[&Self::Commitment],
     points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
@@ -2072,6 +2121,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       vph1s.push(verify_one_poly_phase1::<HyBackend, T256DynPrimeEngine>(
         &vk.params,
         transcript,
+        log,
         points[i],
         evals[i],
         &pp.reduction_round_polys,
@@ -2123,9 +2173,10 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     Self::commit_seg(ck, v, r, &params)
   }
 
-  fn prove_batch_with_params(
+  fn prove_batch_with_params_rng(
     ck: &Self::CommitmentKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comms: &[&Self::Commitment],
     polys: &[&[BigUint]],
     blinds: &[&Self::Blind],
@@ -2133,6 +2184,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     evals: &[&BigUint],
     blocks: &[&[SmallValueBlock]],
     log_t_fs: &[usize],
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
     if log_t_fs.len() != polys.len() {
       return Err(SpartanError::InternalError {
@@ -2146,6 +2198,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     Self::prove_batch_seg(
       ck,
       transcript,
+      log,
       comms,
       polys,
       blinds,
@@ -2153,12 +2206,14 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       evals,
       blocks,
       &params_per,
+      rng,
     )
   }
 
   fn verify_batch_with_params(
     vk: &Self::VerifierKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comms: &[&Self::Commitment],
     points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
@@ -2173,6 +2228,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     Self::verify_batch_seg(
       vk,
       transcript,
+      log,
       comms,
       points,
       evals,
@@ -2227,6 +2283,7 @@ impl IntegerModPCS {
   pub(crate) fn prove_batch_seg(
     ck: &IntegerModCommitmentKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comms: &[&IntegerModCommitment],
     polys: &[&[BigUint]],
     blinds: &[&IntegerModBlind],
@@ -2234,6 +2291,7 @@ impl IntegerModPCS {
     evals: &[&BigUint],
     blocks: &[&[SmallValueBlock]],
     params_per: &[IntEvalParams],
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<IntEvalBatchArgument<HyBackend>, SpartanError> {
     let n = polys.len();
     if n == 0
@@ -2254,9 +2312,11 @@ impl IntegerModPCS {
         &params_per[i],
         ck,
         transcript,
+        log,
         polys[i],
         points[i],
         evals[i],
+        rng,
       )?);
     }
     let mut states: Vec<PerPolyProver<HyBackend>> = Vec::with_capacity(n);
@@ -2278,6 +2338,7 @@ impl IntegerModPCS {
         &comm_inners,
         &blind_inners,
         blocks,
+        rng,
       )?;
     let per_poly = states
       .into_iter()
@@ -2301,6 +2362,7 @@ impl IntegerModPCS {
   pub(crate) fn verify_batch_seg(
     vk: &IntegerModVerifierKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comms: &[&IntegerModCommitment],
     points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
@@ -2323,6 +2385,7 @@ impl IntegerModPCS {
       vph1s.push(verify_one_poly_phase1::<HyBackend, T256DynPrimeEngine>(
         &params_per[i],
         transcript,
+        log,
         points[i],
         evals[i],
         &pp.reduction_round_polys,
@@ -2465,9 +2528,14 @@ where
 
   fn precompute_ck(_ck: &Self::CommitmentKey) {}
 
-  fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
+  fn blind_with_rng(
+    ck: &Self::CommitmentKey,
+    n: usize,
+    _rng: &mut dyn CryptoRngCore,
+  ) -> Self::Blind {
     // Same documented caller contract as the Hyrax impl; the blind itself
-    // is a unit for this non-hiding backend.
+    // is a unit for this non-hiding backend, which draws no prover
+    // randomness at all (`rng` is never touched).
     assert!(
       n <= ck.max_n,
       "IntegerModPCSBd::blind: n = {n} exceeds the commitment-key capacity {}",
@@ -2518,18 +2586,44 @@ where
     vk.params.log_t_f
   }
 
-  fn prove(
+  fn prime_sampler_invocations_for_prove(
+    ck: &Self::CommitmentKey,
+    opening_count: usize,
+    log_t_fs: Option<&[usize]>,
+  ) -> Result<usize, SpartanError> {
+    inteval_prime_invocations(&ck.params, opening_count, log_t_fs)
+  }
+
+  fn prime_sampler_invocations_for_verify(
+    vk: &Self::VerifierKey,
+    opening_count: usize,
+    log_t_fs: Option<&[usize]>,
+  ) -> Result<usize, SpartanError> {
+    inteval_prime_invocations(&vk.params, opening_count, log_t_fs)
+  }
+
+  fn prove_with_rng(
     ck: &Self::CommitmentKey,
     transcript: &mut <ME as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comm: &Self::Commitment,
     poly: &[BigUint],
     blind: &Self::Blind,
     point: &[<ME as SumcheckEngine>::Scalar],
     eval: &BigUint,
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_bd_prove");
-    let mut st =
-      prove_one_poly::<BdBackend<SE>, ME>(&ck.params, &(), transcript, poly, point, eval)?;
+    let mut st = prove_one_poly::<BdBackend<SE>, ME>(
+      &ck.params,
+      &(),
+      transcript,
+      log,
+      poly,
+      point,
+      eval,
+      rng,
+    )?;
     let (range_check, combined_open, _) = finish_batch_open::<BdBackend<SE>, ME>(
       &ck.params,
       &(),
@@ -2538,6 +2632,7 @@ where
       &[&comm.root],
       &[blind],
       &[&[]],
+      rng,
     )?;
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_bd_prove");
     Ok(IntEvalArgument {
@@ -2550,30 +2645,17 @@ where
     })
   }
 
-  fn prove_batch(
+  fn prove_batch_with_blocks_rng(
     ck: &Self::CommitmentKey,
     transcript: &mut <ME as SumcheckEngine>::TE,
-    comms: &[&Self::Commitment],
-    polys: &[&[BigUint]],
-    blinds: &[&Self::Blind],
-    points: &[&[<ME as SumcheckEngine>::Scalar]],
-    evals: &[&BigUint],
-  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
-    let empty: Vec<&[SmallValueBlock]> = vec![&[]; polys.len()];
-    <Self as ModPCSEngineTrait<ME>>::prove_batch_with_blocks(
-      ck, transcript, comms, polys, blinds, points, evals, &empty,
-    )
-  }
-
-  fn prove_batch_with_blocks(
-    ck: &Self::CommitmentKey,
-    transcript: &mut <ME as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comms: &[&Self::Commitment],
     polys: &[&[BigUint]],
     blinds: &[&Self::Blind],
     points: &[&[<ME as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
     blocks: &[&[SmallValueBlock]],
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_bd_prove_batch");
     let n = polys.len();
@@ -2590,9 +2672,11 @@ where
         &ck.params,
         &(),
         transcript,
+        log,
         polys[i],
         points[i],
         evals[i],
+        rng,
       )?);
     }
     let mut states: Vec<PerPolyProver<BdBackend<SE>>> = Vec::with_capacity(n);
@@ -2610,6 +2694,7 @@ where
       &comm_roots,
       blinds,
       blocks,
+      rng,
     )?;
     let per_poly = states
       .into_iter()
@@ -2632,6 +2717,7 @@ where
   fn verify(
     vk: &Self::VerifierKey,
     transcript: &mut <ME as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comm: &Self::Commitment,
     point: &[<ME as SumcheckEngine>::Scalar],
     eval: &BigUint,
@@ -2641,6 +2727,7 @@ where
     let mut v = verify_one_poly::<BdBackend<SE>, ME>(
       &vk.params,
       transcript,
+      log,
       point,
       eval,
       &arg.reduction_round_polys,
@@ -2667,6 +2754,7 @@ where
   fn verify_batch(
     vk: &Self::VerifierKey,
     transcript: &mut <ME as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comms: &[&Self::Commitment],
     points: &[&[<ME as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
@@ -2674,13 +2762,14 @@ where
   ) -> Result<(), SpartanError> {
     let empty: Vec<&[SmallValueBlock]> = vec![&[]; comms.len()];
     <Self as ModPCSEngineTrait<ME>>::verify_batch_with_blocks(
-      vk, transcript, comms, points, evals, arg, &empty,
+      vk, transcript, log, comms, points, evals, arg, &empty,
     )
   }
 
   fn verify_batch_with_blocks(
     vk: &Self::VerifierKey,
     transcript: &mut <ME as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
     comms: &[&Self::Commitment],
     points: &[&[<ME as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
@@ -2698,6 +2787,7 @@ where
       vph1s.push(verify_one_poly_phase1::<BdBackend<SE>, ME>(
         &vk.params,
         transcript,
+        log,
         points[i],
         evals[i],
         &pp.reduction_round_polys,
@@ -2818,9 +2908,11 @@ fn prove_one_poly_phase1<
   params: &IntEvalParams,
   backend_ck: &B::Ck,
   transcript: &mut Keccak256Transcript<ME>,
+  log: &mut PrimeAuditLog,
   poly: &[BigUint],
   point: &[crate::dyn_prime::DynPrime<2>],
   eval: &BigUint,
+  rng: &mut dyn CryptoRngCore,
 ) -> Result<ChainPhase1<B>, SpartanError> {
   let monty = point
     .first()
@@ -2947,8 +3039,9 @@ fn prove_one_poly_phase1<
     Vec::new()
   };
 
+  let width_bits = schedule_width_bits(params.log_p)?;
   let primes: Vec<BigUint> = (0..params.s)
-    .map(|_| sample_small_prime(transcript, params.log_p))
+    .map(|_| sample_small_prime(transcript, width_bits, log))
     .collect::<Result<Vec<_>, SpartanError>>()?;
 
   let (_cb_span, cb_t) = start_span!("imod_pcs_chain_build");
@@ -3096,7 +3189,7 @@ fn prove_one_poly_phase1<
         .par_iter()
         .map(|&c| scalar_from_chunk::<B::Scalar>(c))
         .collect();
-      let blind = B::blind(backend_ck, chunk_fq.len());
+      let blind = B::blind_with_rng(backend_ck, chunk_fq.len(), rng);
       let (comm, data) = B::commit(backend_ck, &chunk_fq, &blind, true)?;
       transcript.absorb_bytes(b"ab_chunk", &B::comm_transcript_bytes(&comm));
       ab_chunk_polys.push(chunk_fq);
@@ -3306,11 +3399,14 @@ fn prove_one_poly<
   params: &IntEvalParams,
   backend_ck: &B::Ck,
   transcript: &mut Keccak256Transcript<ME>,
+  log: &mut PrimeAuditLog,
   poly: &[BigUint],
   point: &[crate::dyn_prime::DynPrime<2>],
   eval: &BigUint,
+  rng: &mut dyn CryptoRngCore,
 ) -> Result<PerPolyProver<B>, SpartanError> {
-  let ph1 = prove_one_poly_phase1::<B, ME>(params, backend_ck, transcript, poly, point, eval)?;
+  let ph1 =
+    prove_one_poly_phase1::<B, ME>(params, backend_ck, transcript, log, poly, point, eval, rng)?;
   prove_one_poly_phase2::<B, ME>(params, transcript, ph1)
 }
 
@@ -3399,6 +3495,7 @@ fn finish_batch_open<
   comms: &[&B::Comm],
   blinds: &[&B::Blind],
   blocks: &[&[SmallValueBlock]],
+  rng: &mut dyn CryptoRngCore,
 ) -> Result<
   (
     SharedRangeCheck<B>,
@@ -3475,7 +3572,7 @@ where
       }
     }
     let (_rc_span, rc_t) = start_span!("imod_pcs_rc_shared");
-    let out = prove_shared_range_check::<B, ME>(backend_ck, &rc_batches, transcript)?;
+    let out = prove_shared_range_check::<B, ME>(backend_ck, &rc_batches, transcript, rng)?;
     info!(elapsed_ms = %rc_t.elapsed().as_millis(), "imod_pcs_rc_shared");
     out
   };
@@ -3595,7 +3692,7 @@ where
     &rc_art.mult_data,
     &rc_art.mult_claims,
   ));
-  let combined_open = prove_combined_batch_open::<B>(backend_ck, &mut bsub, &bo_targets)?;
+  let combined_open = prove_combined_batch_open::<B>(backend_ck, &mut bsub, &bo_targets, rng)?;
   info!(elapsed_ms = %bo_t.elapsed().as_millis(), "imod_pcs_batched_opens");
 
   Ok((range_check, combined_open, small_block_evals))
@@ -3638,6 +3735,7 @@ fn verify_one_poly_phase1<
 >(
   params: &IntEvalParams,
   transcript: &mut Keccak256Transcript<ME>,
+  log: &mut PrimeAuditLog,
   point: &[crate::dyn_prime::DynPrime<2>],
   eval: &BigUint,
   reduction_round_polys: &[Vec<BigUint>],
@@ -3723,8 +3821,9 @@ fn verify_one_poly_phase1<
   info!(elapsed_ms = %vred_t.elapsed().as_millis(), "imod_pcs_verify_reduction_sc");
 
   let _vchain_span = start_span!("imod_pcs_verify_chains").0;
+  let width_bits = schedule_width_bits(params.log_p)?;
   let primes: Vec<BigUint> = (0..params.s)
-    .map(|_| sample_small_prime(transcript, params.log_p))
+    .map(|_| sample_small_prime(transcript, width_bits, log))
     .collect::<Result<Vec<_>, SpartanError>>()?;
   let mut chain_primes: Vec<(BigUint, Vec<BigUint>)> = Vec::with_capacity(params.s);
   for (chain, p_i) in chains.iter().zip(primes.iter()) {
@@ -3918,6 +4017,7 @@ fn verify_one_poly<
 >(
   params: &IntEvalParams,
   transcript: &mut Keccak256Transcript<ME>,
+  log: &mut PrimeAuditLog,
   point: &[crate::dyn_prime::DynPrime<2>],
   eval: &BigUint,
   reduction_round_polys: &[Vec<BigUint>],
@@ -3928,6 +4028,7 @@ fn verify_one_poly<
   let ph1 = verify_one_poly_phase1::<B, ME>(
     params,
     transcript,
+    log,
     point,
     eval,
     reduction_round_polys,
@@ -4134,8 +4235,8 @@ impl CommitBackend for HyBackend {
   type Data = ();
   type BatchOpenArg = HyraxBatchOpenArg;
 
-  fn blind(ck: &Self::Ck, n: usize) -> Self::Blind {
-    Hyrax::blind(&ck.inner, n)
+  fn blind_with_rng(ck: &Self::Ck, n: usize, rng: &mut dyn CryptoRngCore) -> Self::Blind {
+    Hyrax::blind_with_rng(&ck.inner, n, rng)
   }
 
   fn comm_transcript_bytes(comm: &Self::Comm) -> Vec<u8> {
@@ -4161,10 +4262,11 @@ impl CommitBackend for HyBackend {
     Ok(())
   }
 
-  fn open_targets(
+  fn open_targets_with_rng(
     ck: &Self::Ck,
     targets: &[OpenTarget<'_, Self>],
     sub: &mut impl ByteTranscript,
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::BatchOpenArg, SpartanError> {
     let mu_bytes = sub.squeeze_bytes(b"cbo_mu")?;
     let mu = <t256::Scalar as PrimeFieldExt>::from_uniform(&mu_bytes);
@@ -4188,7 +4290,7 @@ impl CommitBackend for HyBackend {
         big_items.push((t.comm, t.poly, t.blind, t.point.clone()));
       } else {
         small_opens.push(hyrax_open_at(
-          &ck.inner, &ck.eval, sub, t.comm, t.poly, t.blind, &t.point,
+          &ck.inner, &ck.eval, sub, t.comm, t.poly, t.blind, &t.point, rng,
         )?);
       }
     }
@@ -4208,6 +4310,7 @@ impl CommitBackend for HyBackend {
         mu,
         &comm_eval,
         &blind_eval,
+        rng,
       )?;
       Some(SmallPrimeOpening {
         f_y: y_star,
@@ -4294,6 +4397,7 @@ fn hyrax_open_at<T: ByteTranscript>(
   poly_fq: &[t256::Scalar],
   blind: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
   point: &[t256::Scalar],
+  rng: &mut dyn CryptoRngCore,
 ) -> Result<SmallPrimeOpening, SpartanError> {
   let f_y = mle_evaluate_fq(poly_fq, point);
   // f_y is sent in the clear in the proof, so the IPA's eval commitment
@@ -4303,7 +4407,7 @@ fn hyrax_open_at<T: ByteTranscript>(
   // `blind_eval` from `SmallPrimeOpening`.
   let blind_eval = HyraxBlind::<T256HyraxEngine>::zero(ck_eval, 1);
   let comm_eval = Hyrax::commit(ck_eval, &[f_y], &blind_eval, false)?;
-  let arg = Hyrax::prove(
+  let arg = Hyrax::prove_with_rng(
     ck,
     ck_eval,
     transcript,
@@ -4313,6 +4417,7 @@ fn hyrax_open_at<T: ByteTranscript>(
     point,
     &comm_eval,
     &blind_eval,
+    rng,
   )?;
   Ok(SmallPrimeOpening {
     f_y,
@@ -4612,6 +4717,7 @@ fn prove_combined_batch_open<B: CommitBackend>(
     &B::Data,
     &OpenClaims<B::Scalar>,
   )],
+  rng: &mut dyn CryptoRngCore,
 ) -> Result<CombinedBatchOpen<B>, SpartanError> {
   use crate::polys::univariate::UniPoly;
   let m = targets.len();
@@ -4700,7 +4806,7 @@ fn prove_combined_batch_open<B: CommitBackend>(
       eval: final_evals[j],
     })
     .collect();
-  let backend = B::open_targets(ck, &open_targets, sub)?;
+  let backend = B::open_targets_with_rng(ck, &open_targets, sub, rng)?;
   info!(elapsed_ms = %bm_t.elapsed().as_millis(), "bo_backend_open");
 
   Ok(CombinedBatchOpen {
@@ -4982,6 +5088,7 @@ fn prove_shared_range_check<
   backend_ck: &B::Ck,
   batches: &[RangeBatchInputs<'_, B>],
   parent: &mut Keccak256Transcript<ME>,
+  rng: &mut dyn CryptoRngCore,
 ) -> Result<(SharedRangeCheck<B>, RcProverArtifacts<B>), SpartanError>
 where
   B::Scalar: crate::big_num::DelayedReduction<B::Scalar>,
@@ -5030,7 +5137,7 @@ where
       chunk_blinds.push((*blind).clone());
       created_comms.push(None);
     } else {
-      let blind = B::blind(backend_ck, d.n_chunks);
+      let blind = B::blind_with_rng(backend_ck, d.n_chunks, rng);
       let (comm, _data) = B::commit(backend_ck, &chunk_fq, &blind, true)?;
       chunk_blinds.push(blind);
       created_comms.push(Some(comm));
@@ -5109,7 +5216,7 @@ where
   let mult =
     crate::logup_gkr::LogUpMultiRangeProof::<B::SE>::multiplicities(CHUNK_BITS, &witness_refs)?;
   let mult_fq: Vec<B::Scalar> = mult.iter().map(|&m| B::Scalar::from(m)).collect();
-  let mult_blind = B::blind(backend_ck, mult_fq.len());
+  let mult_blind = B::blind_with_rng(backend_ck, mult_fq.len(), rng);
   let (mult_comm, mult_data) = B::commit(backend_ck, &mult_fq, &mult_blind, true)?;
   info!(elapsed_ms = %rcm_t.elapsed().as_millis(), "rc_mult_commit");
 
@@ -5542,6 +5649,12 @@ mod tests {
   type MP = IntegerModPCS;
   type DP = DynPrime<2>;
 
+  /// A permissive audit log for tests that exercise the Mod-PCS directly
+  /// (no driver schedule): capacity is the hard cap.
+  fn audit_log() -> PrimeAuditLog {
+    PrimeAuditLog::with_expected(crate::prime_sampler::MAX_PRIME_INVOCATIONS).unwrap()
+  }
+
   /// Setup + commit round-trip: an IntEval-committed polynomial commits
   /// to the same Hyrax handle as a direct Hyrax commit of its
   /// limb-split, base-2^16-chunked representation (the committed-chunk
@@ -5716,6 +5829,75 @@ mod tests {
     }
   }
 
+  /// The P0-D schedule accessors: prover and verifier keys agree, the
+  /// count is `openings · s` for both the plain and the width-grouped
+  /// path (narrowing keeps `s`), slice-length mismatches, empty batches,
+  /// invalid segment widths and an unencodable `log_p` are rejected
+  /// before any draw, and an actual single open appends exactly `s`
+  /// `IntEvalSmallP` records on each side, identical between them.
+  #[test]
+  fn prime_sampler_accessors_agree_and_validate() {
+    use crate::prime_sampler::PrimeSamplerPurpose;
+    let num_vars = 4usize;
+    let n = 1usize << num_vars;
+    let (ck, vk) = <MP as ModPCSEngineTrait<ME>>::setup(b"inteval-sched", n, 256);
+    let s = ck.params.s;
+    let (lt, ltf) = (ck.params.log_t, ck.params.log_t_f);
+    let for_prove = <MP as ModPCSEngineTrait<ME>>::prime_sampler_invocations_for_prove;
+    let for_verify = <MP as ModPCSEngineTrait<ME>>::prime_sampler_invocations_for_verify;
+    assert_eq!(for_prove(&ck, 1, None).unwrap(), s);
+    assert_eq!(for_verify(&vk, 1, None).unwrap(), s);
+    assert_eq!(for_prove(&ck, 3, None).unwrap(), 3 * s);
+    assert_eq!(for_verify(&vk, 3, None).unwrap(), 3 * s);
+    let widths = [lt, ltf];
+    assert_eq!(for_prove(&ck, 2, Some(&widths)).unwrap(), 2 * s);
+    assert_eq!(for_verify(&vk, 2, Some(&widths)).unwrap(), 2 * s);
+    assert!(for_prove(&ck, 1, Some(&widths)).is_err());
+    assert!(for_verify(&vk, 3, Some(&widths)).is_err());
+    assert!(for_prove(&ck, 0, None).is_err());
+    assert!(for_verify(&vk, 0, None).is_err());
+    assert!(for_prove(&ck, 1, Some(&[ltf + lt])).is_err());
+    assert!(for_verify(&vk, 1, Some(&[0])).is_err());
+    let mut bad = ck.params.clone();
+    bad.log_p = 1 << 20;
+    assert!(matches!(
+      inteval_prime_invocations(&bad, 1, None),
+      Err(SpartanError::InvalidInputLength { .. })
+    ));
+
+    let dyn_params = small_dyn_params();
+    let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(3 * i as u32 + 2)).collect();
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 5 + 1) % 37))
+      .collect();
+    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    let eval = integer_mle_evaluate(&poly, &int_point)
+      .mod_floor(&BigInt::from(37u32))
+      .to_biguint()
+      .unwrap();
+    let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
+    let mut plog = PrimeAuditLog::with_expected(s).unwrap();
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"sched", dyn_params);
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck, &mut pt, &mut plog, &comm, &poly, &blind, &point, &eval,
+    )
+    .unwrap();
+    let prover_records = plog.finish_exact().unwrap();
+    assert_eq!(prover_records.len(), s);
+    let width = u16::try_from(ck.params.log_p).unwrap();
+    for rec in &prover_records {
+      assert_eq!(rec.purpose(), PrimeSamplerPurpose::IntEvalSmallP);
+      assert_eq!(rec.width_bits(), width);
+      assert!(rec.is_success());
+    }
+    let mut vlog = PrimeAuditLog::with_expected(s).unwrap();
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"sched", dyn_params);
+    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &mut vlog, &comm, &point, &eval, &arg)
+      .unwrap();
+    assert_eq!(vlog.finish_exact().unwrap(), prover_records);
+  }
+
   /// End-to-end prove/verify with `setup_optimized`-chosen params, both
   /// at a size where the optimizer can skip iterations and at one where
   /// the chain/iteration machinery runs.
@@ -5744,12 +5926,29 @@ mod tests {
       let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
       let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-      let arg =
-        <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
-          .unwrap();
+      let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+        &ck,
+        &mut pt,
+        &mut audit_log(),
+        &comm,
+        &poly,
+        &blind,
+        &point,
+        &eval,
+      )
+      .unwrap();
 
       let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
+      <MP as ModPCSEngineTrait<ME>>::verify(
+        &vk,
+        &mut vt,
+        &mut audit_log(),
+        &comm,
+        &point,
+        &eval,
+        &arg,
+      )
+      .unwrap();
     }
   }
 
@@ -5791,12 +5990,29 @@ mod tests {
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    let arg =
-      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
-        .unwrap();
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &mut pt,
+      &mut audit_log(),
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+    )
+    .unwrap();
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk,
+      &mut vt,
+      &mut audit_log(),
+      &comm,
+      &point,
+      &eval,
+      &arg,
+    )
+    .unwrap();
   }
 
   /// N≥2 batch path: a two-poly `prove_batch` round-trips, and tampering
@@ -5846,14 +6062,29 @@ mod tests {
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-batch", dyn_params);
     let arg = <MP as ModPCSEngineTrait<ME>>::prove_batch(
-      &ck, &mut pt, &comms, &polys, &blinds, &points, &evals,
+      &ck,
+      &mut pt,
+      &mut audit_log(),
+      &comms,
+      &polys,
+      &blinds,
+      &points,
+      &evals,
     )
     .unwrap();
 
     // Positive: the untampered 2-poly batch verifies.
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-batch", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify_batch(&vk, &mut vt, &comms, &points, &evals, &arg)
-      .unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify_batch(
+      &vk,
+      &mut vt,
+      &mut audit_log(),
+      &comms,
+      &points,
+      &evals,
+      &arg,
+    )
+    .unwrap();
 
     // Negative: tampering *either* poly's claimed eval must reject — confirms
     // each claim is checked against the correct commitment.
@@ -5863,8 +6094,16 @@ mod tests {
       let evals_t = if i == 0 { [bad, &eval1] } else { [&eval0, bad] };
       let mut vtt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-batch", dyn_params);
       assert!(
-        <MP as ModPCSEngineTrait<ME>>::verify_batch(&vk, &mut vtt, &comms, &points, &evals_t, &arg)
-          .is_err(),
+        <MP as ModPCSEngineTrait<ME>>::verify_batch(
+          &vk,
+          &mut vtt,
+          &mut audit_log(),
+          &comms,
+          &points,
+          &evals_t,
+          &arg
+        )
+        .is_err(),
         "verify_batch must reject a tampered eval for poly {i}"
       );
     }
@@ -5932,6 +6171,7 @@ mod tests {
     let arg = IntegerModPCS::prove_batch_seg(
       &ck,
       &mut pt,
+      &mut audit_log(),
       &[&comm],
       &[w.as_slice()],
       &[&blind],
@@ -5939,6 +6179,7 @@ mod tests {
       &[&eval],
       &[&[]],
       std::slice::from_ref(&wide),
+      &mut rand::thread_rng(),
     )
     .unwrap();
     let u_open = t.elapsed().as_secs_f64() * 1e3;
@@ -5946,6 +6187,7 @@ mod tests {
     IntegerModPCS::verify_batch_seg(
       &vk,
       &mut vt,
+      &mut audit_log(),
       &[&comm],
       &[point.as_slice()],
       &[&eval],
@@ -5986,13 +6228,34 @@ mod tests {
     let nb: Vec<&[SmallValueBlock]> = vec![&[]; segs.len()];
     let mut pt2 = <ME as SumcheckEngine>::TE::new_with_params(b"s", dp);
     let t = Instant::now();
-    let arg2 =
-      IntegerModPCS::prove_batch_seg(&ck, &mut pt2, &cr, &pr, &br, &ptr, &er, &nb, &params_per)
-        .unwrap();
+    let arg2 = IntegerModPCS::prove_batch_seg(
+      &ck,
+      &mut pt2,
+      &mut audit_log(),
+      &cr,
+      &pr,
+      &br,
+      &ptr,
+      &er,
+      &nb,
+      &params_per,
+      &mut rand::thread_rng(),
+    )
+    .unwrap();
     let s_open = t.elapsed().as_secs_f64() * 1e3;
     let mut vt2 = <ME as SumcheckEngine>::TE::new_with_params(b"s", dp);
-    IntegerModPCS::verify_batch_seg(&vk, &mut vt2, &cr, &ptr, &er, &arg2, &nb, &params_per)
-      .unwrap();
+    IntegerModPCS::verify_batch_seg(
+      &vk,
+      &mut vt2,
+      &mut audit_log(),
+      &cr,
+      &ptr,
+      &er,
+      &arg2,
+      &nb,
+      &params_per,
+    )
+    .unwrap();
 
     println!("REAL layout: num_vars={num_vars}, {} segments", segs.len());
     println!(
@@ -6103,10 +6366,23 @@ mod tests {
     let nb: Vec<&[SmallValueBlock]> = vec![&[]; 4];
     let pp = vec![wide.clone(); 4];
     let mut tp = <ME as SumcheckEngine>::TE::new_with_params(b"four", dp);
-    let a =
-      IntegerModPCS::prove_batch_seg(&ck, &mut tp, &cr, &pr, &br, &ptr, &er, &nb, &pp).unwrap();
+    let a = IntegerModPCS::prove_batch_seg(
+      &ck,
+      &mut tp,
+      &mut audit_log(),
+      &cr,
+      &pr,
+      &br,
+      &ptr,
+      &er,
+      &nb,
+      &pp,
+      &mut rand::thread_rng(),
+    )
+    .unwrap();
     let mut tv = <ME as SumcheckEngine>::TE::new_with_params(b"four", dp);
-    IntegerModPCS::verify_batch_seg(&vk, &mut tv, &cr, &ptr, &er, &a, &nb, &pp).unwrap();
+    IntegerModPCS::verify_batch_seg(&vk, &mut tv, &mut audit_log(), &cr, &ptr, &er, &a, &nb, &pp)
+      .unwrap();
   }
 
   #[test]
@@ -6148,6 +6424,7 @@ mod tests {
     let arg = IntegerModPCS::prove_batch_seg(
       &ck,
       &mut pt,
+      &mut audit_log(),
       &[&c0, &c1],
       &[&poly0, &poly1],
       &[&b0, &b1],
@@ -6155,12 +6432,14 @@ mod tests {
       &[&e0, &e1],
       &nb,
       &pp,
+      &mut rand::thread_rng(),
     )
     .unwrap();
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"ds", dyn_params);
     IntegerModPCS::verify_batch_seg(
       &vk,
       &mut vt,
+      &mut audit_log(),
       &[&c0, &c1],
       &[&pt0, &pt1],
       &[&e0, &e1],
@@ -6215,6 +6494,7 @@ mod tests {
     let arg = IntegerModPCS::prove_batch_seg(
       &ck,
       &mut tp,
+      &mut audit_log(),
       &[&comm],
       &[&poly],
       &[&bl],
@@ -6222,12 +6502,14 @@ mod tests {
       &[&e],
       &blks,
       std::slice::from_ref(&narrow),
+      &mut rand::thread_rng(),
     )
     .unwrap();
     let mut tv = <ME as SumcheckEngine>::TE::new_with_params(b"nb", dp);
     IntegerModPCS::verify_batch_seg(
       &vk,
       &mut tv,
+      &mut audit_log(),
       &[&comm],
       &[&point],
       &[&e],
@@ -6247,6 +6529,7 @@ mod tests {
     let arg2 = IntegerModPCS::prove_batch_seg(
       &ck,
       &mut tp2,
+      &mut audit_log(),
       &[&comm2],
       &[&bad],
       &[&bl],
@@ -6254,6 +6537,7 @@ mod tests {
       &[&e2],
       &blks,
       std::slice::from_ref(&narrow),
+      &mut rand::thread_rng(),
     )
     .unwrap();
     let mut tv2 = <ME as SumcheckEngine>::TE::new_with_params(b"nb", dp);
@@ -6261,6 +6545,7 @@ mod tests {
       IntegerModPCS::verify_batch_seg(
         &vk,
         &mut tv2,
+        &mut audit_log(),
         &[&comm2],
         &[&point],
         &[&e2],
@@ -6328,6 +6613,7 @@ mod tests {
     let arg = IntegerModPCS::prove_batch_seg(
       &ck,
       &mut pt,
+      &mut audit_log(),
       &comms,
       &polys,
       &blinds,
@@ -6335,6 +6621,7 @@ mod tests {
       &evals,
       &no_blocks,
       &params_per,
+      &mut rand::thread_rng(),
     )
     .unwrap();
 
@@ -6342,6 +6629,7 @@ mod tests {
     IntegerModPCS::verify_batch_seg(
       &vk,
       &mut vt,
+      &mut audit_log(),
       &comms,
       &points,
       &evals,
@@ -6359,6 +6647,7 @@ mod tests {
       IntegerModPCS::verify_batch_seg(
         &vk,
         &mut vtb,
+        &mut audit_log(),
         &comms,
         &points,
         &evals_bad,
@@ -6439,6 +6728,7 @@ mod tests {
     let arg = IntegerModPCS::prove_batch_seg(
       &ck,
       &mut pt,
+      &mut audit_log(),
       &[&comm],
       &[&whole],
       &[&blind],
@@ -6446,6 +6736,7 @@ mod tests {
       &[&eval],
       &[&[]],
       std::slice::from_ref(&wide),
+      &mut rand::thread_rng(),
     )
     .unwrap();
     let base_open = t.elapsed().as_secs_f64() * 1e3;
@@ -6453,6 +6744,7 @@ mod tests {
     IntegerModPCS::verify_batch_seg(
       &vk,
       &mut vt,
+      &mut audit_log(),
       &[&comm],
       &[&point],
       &[&eval],
@@ -6476,6 +6768,7 @@ mod tests {
     let arg2 = IntegerModPCS::prove_batch_seg(
       &ck,
       &mut pt2,
+      &mut audit_log(),
       &[&cw, &cn],
       &[&seg_wide, &seg_narrow],
       &[&bw, &bn],
@@ -6483,6 +6776,7 @@ mod tests {
       &[&ew, &en],
       &[&[], &[]],
       &[wide.clone(), narrow.clone()],
+      &mut rand::thread_rng(),
     )
     .unwrap();
     let grp_open = t.elapsed().as_secs_f64() * 1e3;
@@ -6490,6 +6784,7 @@ mod tests {
     IntegerModPCS::verify_batch_seg(
       &vk,
       &mut vt2,
+      &mut audit_log(),
       &[&cw, &cn],
       &[&pt_lo, &pt_lo],
       &[&ew, &en],
@@ -6897,12 +7192,29 @@ mod tests {
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    let arg =
-      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
-        .unwrap();
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &mut pt,
+      &mut audit_log(),
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+    )
+    .unwrap();
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk,
+      &mut vt,
+      &mut audit_log(),
+      &comm,
+      &point,
+      &eval,
+      &arg,
+    )
+    .unwrap();
   }
 
   /// A large witness with an all-zero tail exercises the active-block
@@ -6941,9 +7253,17 @@ mod tests {
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    let arg =
-      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
-        .unwrap();
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &mut pt,
+      &mut audit_log(),
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+    )
+    .unwrap();
 
     // The f batch's chunk polynomial spans multiple 2^16-slot blocks;
     // the zero tail must have deactivated at least one, and the nonzero
@@ -6958,14 +7278,32 @@ mod tests {
     );
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk,
+      &mut vt,
+      &mut audit_log(),
+      &comm,
+      &point,
+      &eval,
+      &arg,
+    )
+    .unwrap();
 
     // Forgery 1: claim an active (nonzero) block is all-zero.
     let mut forged = arg.clone();
     forged.range_check.active_blocks[0][0] = false;
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
     assert!(
-      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &forged).is_err(),
+      <MP as ModPCSEngineTrait<ME>>::verify(
+        &vk,
+        &mut vt,
+        &mut audit_log(),
+        &comm,
+        &point,
+        &eval,
+        &forged
+      )
+      .is_err(),
       "nonzero block forged inactive must fail"
     );
 
@@ -6978,7 +7316,16 @@ mod tests {
     forged.range_check.active_blocks[0][zi] = true;
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
     assert!(
-      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &forged).is_err(),
+      <MP as ModPCSEngineTrait<ME>>::verify(
+        &vk,
+        &mut vt,
+        &mut audit_log(),
+        &comm,
+        &point,
+        &eval,
+        &forged
+      )
+      .is_err(),
       "zero block forged active must fail"
     );
   }
@@ -7010,14 +7357,30 @@ mod tests {
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    let arg =
-      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &real_eval)
-        .unwrap();
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &mut pt,
+      &mut audit_log(),
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &real_eval,
+    )
+    .unwrap();
 
     // Verifier with the bad eval claim must reject.
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    let err = <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &bad_eval, &arg)
-      .unwrap_err();
+    let err = <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk,
+      &mut vt,
+      &mut audit_log(),
+      &comm,
+      &point,
+      &bad_eval,
+      &arg,
+    )
+    .unwrap_err();
     assert!(matches!(err, SpartanError::InvalidSumcheckProof));
   }
 
@@ -7052,12 +7415,29 @@ mod tests {
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter", dyn_params);
-    let arg =
-      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
-        .unwrap();
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &mut pt,
+      &mut audit_log(),
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+    )
+    .unwrap();
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk,
+      &mut vt,
+      &mut audit_log(),
+      &comm,
+      &point,
+      &eval,
+      &arg,
+    )
+    .unwrap();
   }
 
   /// Two-iteration roundtrip (`k=2`, `num_vars=6` → `t=2`). Exercises the
@@ -7087,9 +7467,17 @@ mod tests {
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter2", dyn_params);
-    let arg =
-      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
-        .unwrap();
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &mut pt,
+      &mut audit_log(),
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+    )
+    .unwrap();
 
     // Confirm we actually exercised t=2 (two layers, each with an `a`
     // and a `b` chunk commitment).
@@ -7101,7 +7489,16 @@ mod tests {
     );
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter2", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk,
+      &mut vt,
+      &mut audit_log(),
+      &comm,
+      &point,
+      &eval,
+      &arg,
+    )
+    .unwrap();
   }
 
   /// Step D5 (stacked rbatchrange): tampering *any* range-check group's
@@ -7134,9 +7531,17 @@ mod tests {
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
-    let arg =
-      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
-        .unwrap();
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &mut pt,
+      &mut audit_log(),
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+    )
+    .unwrap();
 
     // Every batch's chunk polynomial IS its target's commitment now, so
     // the range check carries no per-batch proof data at all.
@@ -7153,7 +7558,16 @@ mod tests {
     bad.ab_comms[0] = bad.ab_comms[1].clone();
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
     assert!(
-      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &bad,).is_err(),
+      <MP as ModPCSEngineTrait<ME>>::verify(
+        &vk,
+        &mut vt,
+        &mut audit_log(),
+        &comm,
+        &point,
+        &eval,
+        &bad,
+      )
+      .is_err(),
       "ab chunk-comm tamper not rejected"
     );
 
@@ -7163,7 +7577,16 @@ mod tests {
     bad.range_check.mult_comm = arg.ab_comms[0].clone();
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
     assert!(
-      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &bad,).is_err(),
+      <MP as ModPCSEngineTrait<ME>>::verify(
+        &vk,
+        &mut vt,
+        &mut audit_log(),
+        &comm,
+        &point,
+        &eval,
+        &bad,
+      )
+      .is_err(),
       "mult-comm tamper not rejected"
     );
 
@@ -7172,7 +7595,16 @@ mod tests {
     bad.combined_open.final_evals[0] += t256::Scalar::ONE;
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
     assert!(
-      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &bad,).is_err()
+      <MP as ModPCSEngineTrait<ME>>::verify(
+        &vk,
+        &mut vt,
+        &mut audit_log(),
+        &comm,
+        &point,
+        &eval,
+        &bad,
+      )
+      .is_err()
     );
 
     // Dropping a layer chunk commitment (count mismatch) must be
@@ -7181,7 +7613,16 @@ mod tests {
     short.ab_comms.pop();
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
     assert!(
-      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &short,).is_err()
+      <MP as ModPCSEngineTrait<ME>>::verify(
+        &vk,
+        &mut vt,
+        &mut audit_log(),
+        &comm,
+        &point,
+        &eval,
+        &short,
+      )
+      .is_err()
     );
   }
 
@@ -7228,15 +7669,32 @@ mod tests {
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"limb-split", dyn_params);
-    let arg =
-      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
-        .unwrap();
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &mut pt,
+      &mut audit_log(),
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+    )
+    .unwrap();
     // The reduction sumcheck ran one round → one entry in
     // reduction_round_polys.
     assert_eq!(arg.reduction_round_polys.len(), 1);
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"limb-split", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk,
+      &mut vt,
+      &mut audit_log(),
+      &comm,
+      &point,
+      &eval,
+      &arg,
+    )
+    .unwrap();
   }
 
   /// Regression: limb-split commit when the *inflated* polynomial spans

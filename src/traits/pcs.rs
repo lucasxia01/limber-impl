@@ -12,6 +12,7 @@ use crate::{
 };
 use core::fmt::Debug;
 use ff::Field;
+use rand_core::CryptoRngCore;
 use serde::{Deserialize, Serialize};
 
 /// This trait defines the behavior of the commitment
@@ -57,8 +58,17 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
   /// Call before cloning to ensure copies get precomputed state.
   fn precompute_ck(_ck: &Self::CommitmentKey) {}
 
+  /// Returns a blind to be used for commitment to a polynomial of size
+  /// `n`, drawing every random byte from `rng` (deterministic for a
+  /// seeded generator: the benchmark-coins path).
+  fn blind_with_rng(ck: &Self::CommitmentKey, n: usize, rng: &mut dyn CryptoRngCore)
+  -> Self::Blind;
+
   /// Returns a blind to be used for commitment to a polynomial of size `n`
-  fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind;
+  /// from fresh OS-seeded randomness (the production constructor).
+  fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
+    Self::blind_with_rng(ck, n, &mut rand::thread_rng())
+  }
 
   /// Commits to the provided vector using the provided ck and returns the commitment.
   ///
@@ -138,6 +148,36 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
     point: &[E::Scalar],
     comm_eval: &Self::Commitment,
     blind_eval: &Self::Blind,
+  ) -> Result<Self::EvaluationArgument, SpartanError> {
+    Self::prove_with_rng(
+      ck,
+      ck_eval,
+      transcript,
+      comm,
+      poly,
+      blind,
+      point,
+      comm_eval,
+      blind_eval,
+      &mut rand::thread_rng(),
+    )
+  }
+
+  /// [`prove`](Self::prove) drawing every prover coin (masking vectors,
+  /// argument blinds) from `rng` instead of the thread RNG; the transcript
+  /// challenges are unaffected. Seeded callers obtain a deterministic
+  /// argument.
+  fn prove_with_rng(
+    ck: &Self::CommitmentKey,
+    ck_eval: &Self::CommitmentKey,
+    transcript: &mut impl ByteTranscript,
+    comm: &Self::Commitment,
+    poly: &[E::Scalar],
+    blind: &Self::Blind,
+    point: &[E::Scalar],
+    comm_eval: &Self::Commitment,
+    blind_eval: &Self::Blind,
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::EvaluationArgument, SpartanError>;
 
   /// A method to verify the purported evaluation of a multilinear polynomials

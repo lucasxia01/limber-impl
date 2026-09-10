@@ -2,8 +2,9 @@
 //!
 //! Mirrors `crate::imod_spartan` but the shape, witness, and matrix
 //! entries are integer-valued (`BigUint`), the prime `p` over which the
-//! sumcheck runs is sampled from the transcript via Fiat-Shamir (Miller-
-//! Rabin rejection sampling, see `M::sample_params`), and the SNARK
+//! sumcheck runs is sampled from the transcript via Fiat-Shamir (the
+//! bounded, audited P0-D sampler, see `M::sample_params` and
+//! `crate::prime_sampler`), and the SNARK
 //! verifies the IntMod-R1CS relation `Az ∘ Bz = Cz + m ∘ q` mod that
 //! sampled `p`. The Mod-PCS commits integer polynomials and opens at
 //! `Z_p` points returning `Z_p` evals — the `p ≠ q` reconciliation is
@@ -15,9 +16,9 @@
 //!   1. Bootstrap transcript with `M::bootstrap_params()` (placeholder).
 //!   2. Byte-absorb the vk digest, two integer-poly commitments, and the
 //!      public IO `x` (`BigUint` LE bytes).
-//!   3. `params = M::sample_params(transcript)` derives `p` from squeeze
-//!      bytes; `transcript.set_params(params)` switches typed-squeeze
-//!      reductions into `Z_p`.
+//!   3. `params = M::sample_params(transcript, log)` derives `p` from
+//!      squeeze bytes; `transcript.set_params(params)` switches
+//!      typed-squeeze reductions into `Z_p`.
 //!   4. Reduce shape/witness/IO `BigUint`s to `M::Scalar` mod `p`.
 //!   5. Run outer + inner sumchecks in `Z_p`.
 //!   6. Open `w` and `q` at `Z_p` points via `M::ModPCS::prove`, passing
@@ -25,12 +26,25 @@
 //!
 //! Single witness segment; no shared/precommitted/rest split; no limb
 //! decomposition; no range checks; no BDDT first-round optimization.
+//!
+//! Prime-sampler audit (P0-D): before the runtime-modulus draw, `prove`
+//! and `verify` compute the exact number of sampler invocations their
+//! schedule performs — one runtime draw plus the Mod-PCS accessor result
+//! for the single batched open they issue — reject a total above
+//! `MAX_PRIME_INVOCATIONS`, construct one `PrimeAuditLog`, thread it
+//! through `sample_params` and the trait call, and `finish_exact` it on
+//! success. `prove_with_prime_audit` / `verify_with_prime_audit` return
+//! the records alongside the value or error; `prove` / `verify` wrap them
+//! and discard only that diagnostic copy.
 
 use crate::{
   errors::SpartanError,
   imod_r1cs_modp::{IntModR1CSInstanceModp, IntModR1CSShapeModp, IntModR1CSWitnessModp},
   math::Math,
   polys_modp::{eq::EqPolynomial, multilinear::MultilinearPolynomial},
+  prime_sampler::{
+    MAX_PRIME_INVOCATIONS, PrimeAuditLog, PrimeAuditedOutcome, checked_schedule_add,
+  },
   provider::keccak::Keccak256Transcript,
   start_span,
   sumcheck_modp::SumcheckProof,
@@ -40,6 +54,7 @@ use crate::{
   },
 };
 use num_bigint::BigUint;
+use rand_core::{CryptoRng, CryptoRngCore, RngCore};
 use rayon::prelude::*;
 use tracing::info;
 
@@ -322,6 +337,63 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
   pub fn eval_arg_bytes(&self) -> Result<Vec<u8>, SpartanError> {
     to_canonical_bytes(&self.eval_arg)
   }
+
+  /// `(outer sumcheck rounds, inner sumcheck rounds, claimed evaluations)`
+  /// of the non-Mod-PCS proof remainder: the five outer claims
+  /// (`v_a, v_b, v_c, v_m, v_q`), `eval_w`, and one evaluation per width
+  /// segment. Structural counts only; see
+  /// [`sumcheck_remainder_bytes`](Self::sumcheck_remainder_bytes) for the
+  /// values.
+  pub fn sumcheck_remainder_counts(&self) -> (usize, usize, usize) {
+    (
+      self.sc_outer.compressed_polys.len(),
+      self.sc_inner.compressed_polys.len(),
+      6 + self.seg_evals.len(),
+    )
+  }
+
+  /// A canonical, length-framed little-endian serialization of every
+  /// proof component outside the Mod-PCS batch argument — the outer and
+  /// inner sumcheck round polynomials (compressed coefficient vectors),
+  /// the five outer claims, `eval_w` and the per-segment evaluations —
+  /// each scalar as its canonical LE bytes under a `u16` length prefix,
+  /// each vector under a `u32` count prefix. The dynamic-prime scalars
+  /// have no serde form, so this is the byte identity the benchmark's
+  /// double-construction check compares (`DynPrime` values of equal
+  /// modulus context serialize identically iff they are equal).
+  pub fn sumcheck_remainder_bytes(&self) -> Vec<u8> {
+    fn push_scalar<F: SumcheckField>(out: &mut Vec<u8>, v: &F) {
+      let bytes = v.to_le_bytes();
+      let len = u16::try_from(bytes.len()).expect("a field element is shorter than 64 KiB");
+      out.extend_from_slice(&len.to_le_bytes());
+      out.extend_from_slice(&bytes);
+    }
+    fn push_count(out: &mut Vec<u8>, n: usize) {
+      let n = u32::try_from(n).expect("proof vectors are shorter than 2^32");
+      out.extend_from_slice(&n.to_le_bytes());
+    }
+    fn push_sumcheck<M: ModEngine>(out: &mut Vec<u8>, sc: &SumcheckProof<M>) {
+      push_count(out, sc.compressed_polys.len());
+      for poly in &sc.compressed_polys {
+        push_count(out, poly.coeffs_except_linear_term.len());
+        for c in &poly.coeffs_except_linear_term {
+          push_scalar(out, c);
+        }
+      }
+    }
+    let mut out = Vec::new();
+    push_sumcheck(&mut out, &self.sc_outer);
+    for v in [&self.v_a, &self.v_b, &self.v_c, &self.v_m, &self.v_q] {
+      push_scalar(&mut out, v);
+    }
+    push_sumcheck(&mut out, &self.sc_inner);
+    push_scalar(&mut out, &self.eval_w);
+    push_count(&mut out, self.seg_evals.len());
+    for v in &self.seg_evals {
+      push_scalar(&mut out, v);
+    }
+    out
+  }
 }
 
 impl<M> IntModSpartanModpSNARK<M>
@@ -347,7 +419,8 @@ where
     for xi in &U.x {
       transcript.absorb_bytes(b"x", &xi.to_bytes_le());
     }
-    M::sample_params(&mut transcript)
+    let mut log = PrimeAuditLog::with_expected(1).expect("one runtime draw is within the cap");
+    M::sample_params(&mut transcript, &mut log).expect("test fixture runtime prime samples")
   }
   /// Setup: derive prover and verifier keys from the shape.
   pub fn setup(
@@ -391,11 +464,175 @@ where
     (pk, vk)
   }
 
-  /// Prove satisfaction of the IntMod-R1CS instance.
+  /// The per-polynomial segment widths of the width-grouped open, or
+  /// `None` for the plain two-polynomial (`W`, `Q`) open — the exact
+  /// `log_t_fs` argument the driver passes to `*_with_params`.
+  fn open_schedule(shape: &IntModR1CSShapeModp<M>, native_log_t_f: usize) -> Option<Vec<usize>> {
+    let segs = shape.width_segments();
+    if segs.is_empty() {
+      return None;
+    }
+    let mut log_t_fs: Vec<usize> = segs.iter().map(|seg| seg.log_t_f).collect();
+    log_t_fs.push(native_log_t_f);
+    Some(log_t_fs)
+  }
+
+  /// Total prime-sampler invocations of the driver: one runtime draw plus
+  /// `pcs` (the Mod-PCS accessor result), rejecting a total above the cap.
+  fn total_prime_invocations(pcs: usize) -> Result<usize, SpartanError> {
+    let total = checked_schedule_add(1, pcs)?;
+    if total > MAX_PRIME_INVOCATIONS {
+      return Err(SpartanError::PrimeAuditLog {
+        reason: format!(
+          "the proof schedule needs {total} prime-sampler invocations, above the cap \
+           {MAX_PRIME_INVOCATIONS}"
+        ),
+      });
+    }
+    Ok(total)
+  }
+
+  /// Exact number of P0-D prime-sampler invocations `prove` performs
+  /// under `pk`: one runtime-modulus draw plus the Mod-PCS count for the
+  /// single batched open (two polynomials, or one per width segment plus
+  /// `Q`). Computed — with every width conversion validated — before any
+  /// transcript draw; a total above `MAX_PRIME_INVOCATIONS` is rejected.
+  pub fn prime_sampler_invocations_for_prove(
+    pk: &IntModSpartanModpProverKey<M>,
+  ) -> Result<usize, SpartanError> {
+    let native = <ModPCS<M> as ModPCSEngineTrait<M>>::commitment_log_t_f(&pk.ck);
+    let pcs = match Self::open_schedule(&pk.shape, native) {
+      None => {
+        <ModPCS<M> as ModPCSEngineTrait<M>>::prime_sampler_invocations_for_prove(&pk.ck, 2, None)?
+      }
+      Some(log_t_fs) => <ModPCS<M> as ModPCSEngineTrait<M>>::prime_sampler_invocations_for_prove(
+        &pk.ck,
+        log_t_fs.len(),
+        Some(&log_t_fs),
+      )?,
+    };
+    Self::total_prime_invocations(pcs)
+  }
+
+  /// Verifier mirror of
+  /// [`prime_sampler_invocations_for_prove`](Self::prime_sampler_invocations_for_prove):
+  /// the count `verify` performs under `vk`. Agrees with the prover's for
+  /// matching keys.
+  pub fn prime_sampler_invocations_for_verify(
+    vk: &IntModSpartanModpVerifierKey<M>,
+  ) -> Result<usize, SpartanError> {
+    let native = <ModPCS<M> as ModPCSEngineTrait<M>>::verifier_log_t_f(&vk.vk_ee);
+    let pcs = match Self::open_schedule(&vk.shape, native) {
+      None => <ModPCS<M> as ModPCSEngineTrait<M>>::prime_sampler_invocations_for_verify(
+        &vk.vk_ee, 2, None,
+      )?,
+      Some(log_t_fs) => <ModPCS<M> as ModPCSEngineTrait<M>>::prime_sampler_invocations_for_verify(
+        &vk.vk_ee,
+        log_t_fs.len(),
+        Some(&log_t_fs),
+      )?,
+    };
+    Self::total_prime_invocations(pcs)
+  }
+
+  /// Run `body` against a fresh audit log sized by `expected`, then
+  /// enforce the exact record count on success. Every failure — schedule
+  /// validation, the run itself, or the exact-count check — keeps the
+  /// records appended so far.
+  fn run_audited<T>(
+    expected: Result<usize, SpartanError>,
+    body: impl FnOnce(&mut PrimeAuditLog) -> Result<T, SpartanError>,
+  ) -> PrimeAuditedOutcome<T> {
+    let mut log = match expected.and_then(PrimeAuditLog::with_expected) {
+      Ok(log) => log,
+      Err(source) => {
+        return PrimeAuditedOutcome::Failure {
+          source,
+          records: Vec::new(),
+        };
+      }
+    };
+    match body(&mut log) {
+      Ok(value) => {
+        let snapshot = log.records().to_vec();
+        match log.finish_exact() {
+          Ok(records) => PrimeAuditedOutcome::Success { value, records },
+          Err(source) => PrimeAuditedOutcome::Failure {
+            source,
+            records: snapshot,
+          },
+        }
+      }
+      Err(source) => PrimeAuditedOutcome::Failure {
+        source,
+        records: log.into_records(),
+      },
+    }
+  }
+
+  /// [`prove`](Self::prove) with the complete prime-sampler audit log:
+  /// the schedule is validated and the one log constructed before the
+  /// runtime-modulus draw; on success the log holds exactly the scheduled
+  /// number of records, on failure the completed prefix.
+  pub fn prove_with_prime_audit(
+    pk: &IntModSpartanModpProverKey<M>,
+    U: &IntModR1CSInstanceModp<M>,
+    W: &IntModR1CSWitnessModp<M>,
+  ) -> PrimeAuditedOutcome<Self> {
+    Self::prove_with_prime_audit_rng(pk, U, W, &mut rand::thread_rng())
+  }
+
+  /// [`prove_with_prime_audit`](Self::prove_with_prime_audit) drawing
+  /// every prover coin — the Mod-PCS internal commitment blinds and the
+  /// Hyrax/IPA masking randomness — from `rng` instead of the thread RNG.
+  /// The transcript challenges and the P0-D prime draws are transcript
+  /// squeezes and do not consume `rng`. With a seeded generator (and a
+  /// witness committed by `IntModR1CSWitnessModp::new_with_rng` from the
+  /// same coins) the proof bytes are reproducible; Brakedown draws no
+  /// prover randomness at all.
+  pub fn prove_with_prime_audit_rng(
+    pk: &IntModSpartanModpProverKey<M>,
+    U: &IntModR1CSInstanceModp<M>,
+    W: &IntModR1CSWitnessModp<M>,
+    rng: &mut (impl RngCore + CryptoRng),
+  ) -> PrimeAuditedOutcome<Self> {
+    let rng: &mut dyn CryptoRngCore = rng;
+    Self::run_audited(Self::prime_sampler_invocations_for_prove(pk), |log| {
+      Self::prove_inner(pk, U, W, log, rng)
+    })
+  }
+
+  /// [`prove`](Self::prove) drawing every prover coin from `rng` (see
+  /// [`prove_with_prime_audit_rng`](Self::prove_with_prime_audit_rng));
+  /// the diagnostic audit copy is discarded.
+  pub fn prove_with_rng(
+    pk: &IntModSpartanModpProverKey<M>,
+    U: &IntModR1CSInstanceModp<M>,
+    W: &IntModR1CSWitnessModp<M>,
+    rng: &mut (impl RngCore + CryptoRng),
+  ) -> Result<Self, SpartanError> {
+    Self::prove_with_prime_audit_rng(pk, U, W, rng).into_result()
+  }
+
+  /// Prove satisfaction of the IntMod-R1CS instance. Wraps
+  /// [`prove_with_prime_audit`](Self::prove_with_prime_audit) and
+  /// discards only the diagnostic audit copy.
   pub fn prove(
     pk: &IntModSpartanModpProverKey<M>,
     U: &IntModR1CSInstanceModp<M>,
     W: &IntModR1CSWitnessModp<M>,
+  ) -> Result<Self, SpartanError> {
+    Self::prove_with_prime_audit(pk, U, W).into_result()
+  }
+
+  /// The proving flow against a caller-owned audit log (see the module
+  /// docs for the schedule).
+  fn prove_inner(
+    pk: &IntModSpartanModpProverKey<M>,
+    U: &IntModR1CSInstanceModp<M>,
+    W: &IntModR1CSWitnessModp<M>,
+    log: &mut PrimeAuditLog,
+    rng: &mut dyn CryptoRngCore,
   ) -> Result<Self, SpartanError> {
     let (_prove_span, prove_t) = start_span!("imod_spartan_modp_prove");
 
@@ -416,7 +653,7 @@ where
 
     // 3. Sample `p` from the transcript and switch typed-squeeze context.
     let (_sp_span, sp_t) = start_span!("imod_modp_sample_p");
-    let params = M::sample_params(&mut transcript);
+    let params = M::sample_params(&mut transcript, log)?;
     transcript.set_params(params.clone());
     info!(elapsed_ms = %sp_t.elapsed().as_millis(), "imod_modp_sample_p");
 
@@ -540,15 +777,17 @@ where
     let segs = pk.shape.width_segments();
     let mut seg_evals: Vec<MScalar<M>> = Vec::new();
     let eval_arg = if segs.is_empty() {
-      <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_blocks(
+      <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_blocks_rng(
         &pk.ck,
         &mut transcript,
+        log,
         &[&U.comm_w[0], &U.comm_q],
         &[W.w.as_slice(), W.q.as_slice()],
         &[&W.r_w[0], &W.r_q],
         &[&r_y[1..], &r_x[..]],
         &[&eval_w_bu, &v_q_bu],
         &[pk.shape.small_blocks.as_slice(), &[]],
+        rng,
       )?
     } else {
       // Width-grouped open: one poly per segment (at its own bound) plus Q.
@@ -587,9 +826,10 @@ where
       let mut blocks_ref: Vec<&[SmallValueBlock]> =
         seg_blocks.iter().map(|v| v.as_slice()).collect();
       blocks_ref.push(&[]);
-      <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_params(
+      <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_params_rng(
         &pk.ck,
         &mut transcript,
+        log,
         &comms,
         &slices,
         &blinds,
@@ -597,6 +837,7 @@ where
         &ev_refs,
         &blocks_ref,
         &log_t_fs,
+        rng,
       )?
     };
     info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_modp_wq_open");
@@ -616,11 +857,37 @@ where
     })
   }
 
-  /// Verify the SNARK against an instance.
+  /// [`verify`](Self::verify) with the complete prime-sampler audit log
+  /// (the verifier-side counterpart of
+  /// [`prove_with_prime_audit`](Self::prove_with_prime_audit)); for an
+  /// honest proof the records equal the prover's.
+  pub fn verify_with_prime_audit(
+    &self,
+    vk: &IntModSpartanModpVerifierKey<M>,
+    U: &IntModR1CSInstanceModp<M>,
+  ) -> PrimeAuditedOutcome<()> {
+    Self::run_audited(Self::prime_sampler_invocations_for_verify(vk), |log| {
+      self.verify_inner(vk, U, log)
+    })
+  }
+
+  /// Verify the SNARK against an instance. Wraps
+  /// [`verify_with_prime_audit`](Self::verify_with_prime_audit) and
+  /// discards only the diagnostic audit copy.
   pub fn verify(
     &self,
     vk: &IntModSpartanModpVerifierKey<M>,
     U: &IntModR1CSInstanceModp<M>,
+  ) -> Result<(), SpartanError> {
+    self.verify_with_prime_audit(vk, U).into_result()
+  }
+
+  /// The verification flow against a caller-owned audit log.
+  fn verify_inner(
+    &self,
+    vk: &IntModSpartanModpVerifierKey<M>,
+    U: &IntModR1CSInstanceModp<M>,
+    log: &mut PrimeAuditLog,
   ) -> Result<(), SpartanError> {
     let (_verify_span, verify_t) = start_span!("imod_spartan_modp_verify");
 
@@ -640,7 +907,7 @@ where
 
     // 3. Re-sample `p` from the same byte stream → identical params.
     let (_sp_span, sp_t) = start_span!("imod_modp_sample_p");
-    let params = M::sample_params(&mut transcript);
+    let params = M::sample_params(&mut transcript, log)?;
     transcript.set_params(params.clone());
     info!(elapsed_ms = %sp_t.elapsed().as_millis(), "imod_modp_sample_p");
 
@@ -739,6 +1006,7 @@ where
       <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch_with_blocks(
         &vk.vk_ee,
         &mut transcript,
+        log,
         &[&U.comm_w[0], &U.comm_q],
         &[&r_y[1..], &r_x[..]],
         &[&eval_w_bu, &v_q_bu],
@@ -782,6 +1050,7 @@ where
       <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch_with_params(
         &vk.vk_ee,
         &mut transcript,
+        log,
         &comms,
         &points,
         &ev_refs,
@@ -1067,7 +1336,8 @@ mod tests {
       t.absorb(b"comm_w", cw);
     }
     t.absorb(b"comm_q", &U.comm_q);
-    let params = <ME as ModEngine>::sample_params(&mut t);
+    let mut log = PrimeAuditLog::with_expected(1).unwrap();
+    let params = <ME as ModEngine>::sample_params(&mut t, &mut log).unwrap();
     proof.v_q += MScalar::<ME>::one(&params);
     assert!(proof.verify(&vk, &U).is_err());
   }
@@ -1699,6 +1969,286 @@ mod tests {
     assert_eq!(comms, [cw, cq].concat());
   }
 
+  /// Seeded prover coins reproduce the proof: two witness commitments and
+  /// proofs from identical `ChaCha20Rng` seeds yield identical
+  /// commitment bytes, evaluation-argument bytes, remainder bytes and
+  /// audit logs (the benchmark's double-construction invariant), while
+  /// a different seed changes the Hyrax commitments.
+  #[test]
+  fn imod_modp_prove_with_rng_is_reproducible() {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+    let one = BigUint::from(1u32);
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 5, one)];
+    let mods = vec![BigUint::from(14u32), BigUint::from(0u32)];
+    let shape = IntModR1CSShapeModp::<ME>::new(2, 4, 3, mat_a, mat_b, mat_c, mods).unwrap();
+    let w: Vec<BigUint> = [3u32, 5, 0, 0].iter().map(|v| BigUint::from(*v)).collect();
+    let q: Vec<BigUint> = [1u32, 0].iter().map(|v| BigUint::from(*v)).collect();
+    let x = vec![
+      BigUint::from(1u32),
+      BigUint::from(2u32),
+      BigUint::from(3u32),
+    ];
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let construct = |seed: [u8; 32]| {
+      let mut rng = ChaCha20Rng::from_seed(seed);
+      let (witness, instance) = IntModR1CSWitnessModp::<ME>::new_with_rng(
+        &shape,
+        &pk.ck,
+        w.clone(),
+        q.clone(),
+        x.clone(),
+        &mut rng,
+      )
+      .unwrap();
+      let (proof, records) = match IntModSpartanModpSNARK::<ME>::prove_with_prime_audit_rng(
+        &pk, &instance, &witness, &mut rng,
+      ) {
+        PrimeAuditedOutcome::Success { value, records } => (value, records),
+        PrimeAuditedOutcome::Failure { source, .. } => panic!("prove failed: {source:?}"),
+      };
+      proof.verify(&vk, &instance).unwrap();
+      (
+        instance.commitment_bytes().unwrap(),
+        proof.eval_arg_bytes().unwrap(),
+        proof.sumcheck_remainder_bytes(),
+        proof.sumcheck_remainder_counts(),
+        records,
+      )
+    };
+    let a = construct([7u8; 32]);
+    let b = construct([7u8; 32]);
+    assert_eq!(a, b, "identical seeds must reproduce every proof component");
+    assert!(!a.1.is_empty() && !a.2.is_empty());
+    let c = construct([8u8; 32]);
+    assert_ne!(a.0, c.0, "a different seed changes the hiding commitments");
+    assert_eq!(
+      a.3, c.3,
+      "the remainder structure does not depend on the coins"
+    );
+    // `prove_with_rng` is the unaudited wrapper of the same path.
+    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+    let (witness, instance) = IntModR1CSWitnessModp::<ME>::new_with_rng(
+      &shape,
+      &pk.ck,
+      w.clone(),
+      q.clone(),
+      x.clone(),
+      &mut rng,
+    )
+    .unwrap();
+    let proof =
+      IntModSpartanModpSNARK::<ME>::prove_with_rng(&pk, &instance, &witness, &mut rng).unwrap();
+    assert_eq!(instance.commitment_bytes().unwrap(), a.0);
+    assert_eq!(proof.eval_arg_bytes().unwrap(), a.1);
+    assert_eq!(proof.sumcheck_remainder_bytes(), a.2);
+  }
+
+  /// The prover's and verifier's P0-D audit logs of an honest proof are
+  /// complete (exactly the scheduled count) and identical, and every
+  /// record has the scheduled purpose and width.
+  fn assert_audited_roundtrip<M>(
+    pk: &IntModSpartanModpProverKey<M>,
+    vk: &IntModSpartanModpVerifierKey<M>,
+    U: &IntModR1CSInstanceModp<M>,
+    W: &IntModR1CSWitnessModp<M>,
+    small_width: u16,
+    openings: usize,
+    s: usize,
+  ) where
+    M: ModEngine<TE = Keccak256Transcript<M>>,
+  {
+    use crate::prime_sampler::{PrimeSamplerPurpose, RUNTIME_P_WIDTH_BITS};
+    let expected_p = IntModSpartanModpSNARK::<M>::prime_sampler_invocations_for_prove(pk).unwrap();
+    let expected_v = IntModSpartanModpSNARK::<M>::prime_sampler_invocations_for_verify(vk).unwrap();
+    assert_eq!(expected_p, expected_v);
+    assert_eq!(expected_p, 1 + openings * s);
+    let (proof, prover_records) =
+      match IntModSpartanModpSNARK::<M>::prove_with_prime_audit(pk, U, W) {
+        PrimeAuditedOutcome::Success { value, records } => (value, records),
+        PrimeAuditedOutcome::Failure { source, .. } => panic!("prove failed: {source:?}"),
+      };
+    assert_eq!(prover_records.len(), expected_p);
+    assert_eq!(prover_records[0].purpose(), PrimeSamplerPurpose::RuntimeP);
+    assert_eq!(prover_records[0].width_bits(), RUNTIME_P_WIDTH_BITS);
+    for rec in &prover_records[1..] {
+      assert_eq!(rec.purpose(), PrimeSamplerPurpose::IntEvalSmallP);
+      assert_eq!(rec.width_bits(), small_width);
+      assert!(rec.is_success());
+      assert_eq!(rec.mr_rounds_completed(), crate::prime_sampler::MR_ROUNDS);
+    }
+    let outcome = proof.verify_with_prime_audit(vk, U);
+    assert!(outcome.is_success(), "{outcome:?}");
+    assert_eq!(outcome.records(), prover_records.as_slice());
+    // The production wrappers see the same value / result.
+    proof.verify(vk, U).unwrap();
+  }
+
+  /// Audited round trip on the toy circuit: Hyrax engine, plain
+  /// two-polynomial open (`W`, `Q`).
+  #[test]
+  fn imod_modp_audited_roundtrip_hyrax() {
+    let (shape, w, q) = build_toy(3, 5, 1, 14, 1);
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    let s = pk.ck.params.s;
+    let width = u16::try_from(pk.ck.params.log_p).unwrap();
+    assert_audited_roundtrip::<ME>(&pk, &vk, &U, &W, width, 2, s);
+  }
+
+  /// Audited round trip through the Brakedown engine.
+  #[test]
+  fn imod_modp_audited_roundtrip_brakedown() {
+    type BE = crate::provider::T256DynPrimeBdEngine;
+    let one = BigUint::from(1u32);
+    let zero = BigUint::from(0u32);
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 2, one)];
+    let mods = vec![BigUint::from(14u64), zero.clone()];
+    let shape = IntModR1CSShapeModp::<BE>::new(2, 4, 0, mat_a, mat_b, mat_c, mods).unwrap();
+    let w = vec![
+      BigUint::from(3u64),
+      BigUint::from(5u64),
+      BigUint::from(1u64),
+      zero.clone(),
+    ];
+    let q = vec![BigUint::from(1u64), zero];
+    let (pk, vk) = IntModSpartanModpSNARK::<BE>::setup(shape.clone()).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<BE>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    let s = pk.ck.params.s;
+    let width = u16::try_from(pk.ck.params.log_p).unwrap();
+    assert_audited_roundtrip::<BE>(&pk, &vk, &U, &W, width, 2, s);
+  }
+
+  /// Audited round trip on a width-segmented shape: the schedule is one
+  /// opening per segment plus `Q`, each at the narrowed params' `s`.
+  #[test]
+  fn imod_modp_audited_roundtrip_width_segments() {
+    use crate::{imod_r1cs_modp::WidthSegment, provider::pcs::integer_modpcs::IntEvalParams};
+    let (shape, w, q) = build_toy(3, 5, 1, 14, 1);
+    let shape = shape
+      .with_width_segments(vec![
+        WidthSegment {
+          start: 0,
+          log_len: 1,
+          log_t_f: 32,
+        },
+        WidthSegment {
+          start: 2,
+          log_len: 1,
+          log_t_f: 64,
+        },
+      ])
+      .unwrap();
+    let params = IntEvalParams::derive(64, 32, 2, 2).unwrap();
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    assert_eq!(U.comm_w.len(), 2);
+    let s = pk.ck.params.s;
+    let width = u16::try_from(pk.ck.params.log_p).unwrap();
+    assert_audited_roundtrip::<ME>(&pk, &vk, &U, &W, width, 3, s);
+  }
+
+  /// Driver-level undercount and overcount fail closed: a log one short
+  /// of the schedule refuses the final invocation before that draw (and
+  /// keeps every earlier record); a log one long completes the run but
+  /// fails `finish_exact`.
+  #[test]
+  fn imod_modp_schedule_undercount_and_overcount_fail_closed() {
+    let (shape, w, q) = build_toy(3, 5, 1, 14, 1);
+    let (pk, _vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    let expected = IntModSpartanModpSNARK::<ME>::prime_sampler_invocations_for_prove(&pk).unwrap();
+    assert!(expected >= 2);
+
+    let mut short = PrimeAuditLog::with_expected(expected - 1).unwrap();
+    let err =
+      IntModSpartanModpSNARK::<ME>::prove_inner(&pk, &U, &W, &mut short, &mut rand::thread_rng())
+        .unwrap_err();
+    assert!(matches!(err, SpartanError::PrimeAuditLog { .. }), "{err:?}");
+    assert_eq!(short.records().len(), expected - 1);
+    assert!(short.records().iter().all(|r| r.is_success()));
+
+    let mut long = PrimeAuditLog::with_expected(expected + 1).unwrap();
+    IntModSpartanModpSNARK::<ME>::prove_inner(&pk, &U, &W, &mut long, &mut rand::thread_rng())
+      .unwrap();
+    assert_eq!(long.records().len(), expected);
+    assert!(matches!(
+      long.finish_exact(),
+      Err(SpartanError::PrimeAuditLog { .. })
+    ));
+  }
+
+  /// Schedule validation failures — a `log_p` that does not fit the
+  /// sampler's `u16` width, a total above the cap, and a verifier key
+  /// whose count disagrees with the prover's — fail before the first
+  /// transcript draw (no audit record) or, for the disagreeing verifier,
+  /// reject the proof.
+  #[test]
+  fn imod_modp_schedule_validation_fails_before_the_first_draw() {
+    let (shape, w, q) = build_toy(3, 5, 1, 14, 1);
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &U, &W).unwrap();
+
+    // Width conversion failure on either side.
+    let mut bad_vk = vk.clone();
+    bad_vk.vk_ee.params.log_p = 1 << 20;
+    assert!(matches!(
+      IntModSpartanModpSNARK::<ME>::prime_sampler_invocations_for_verify(&bad_vk),
+      Err(SpartanError::InvalidInputLength { .. })
+    ));
+    match proof.verify_with_prime_audit(&bad_vk, &U) {
+      PrimeAuditedOutcome::Failure { source, records } => {
+        assert!(matches!(source, SpartanError::InvalidInputLength { .. }));
+        assert!(records.is_empty(), "no draw before schedule validation");
+      }
+      PrimeAuditedOutcome::Success { .. } => panic!("must fail"),
+    }
+    let mut bad_pk = pk.clone();
+    bad_pk.ck.params.log_p = 1 << 20;
+    match IntModSpartanModpSNARK::<ME>::prove_with_prime_audit(&bad_pk, &U, &W) {
+      PrimeAuditedOutcome::Failure { source, records } => {
+        assert!(matches!(source, SpartanError::InvalidInputLength { .. }));
+        assert!(records.is_empty());
+      }
+      PrimeAuditedOutcome::Success { .. } => panic!("must fail"),
+    }
+
+    // A schedule above the hard cap.
+    let mut huge_vk = vk.clone();
+    huge_vk.vk_ee.params.s = MAX_PRIME_INVOCATIONS;
+    assert!(matches!(
+      IntModSpartanModpSNARK::<ME>::prime_sampler_invocations_for_verify(&huge_vk),
+      Err(SpartanError::PrimeAuditLog { .. })
+    ));
+    match proof.verify_with_prime_audit(&huge_vk, &U) {
+      PrimeAuditedOutcome::Failure { source, records } => {
+        assert!(matches!(source, SpartanError::PrimeAuditLog { .. }));
+        assert!(records.is_empty());
+      }
+      PrimeAuditedOutcome::Success { .. } => panic!("must fail"),
+    }
+
+    // Prover / verifier count disagreement: the accessors differ and the
+    // verifier rejects the proof before sampling any IntEval prime.
+    let mut skewed_vk = vk.clone();
+    skewed_vk.vk_ee.params.s += 1;
+    assert_ne!(
+      IntModSpartanModpSNARK::<ME>::prime_sampler_invocations_for_prove(&pk).unwrap(),
+      IntModSpartanModpSNARK::<ME>::prime_sampler_invocations_for_verify(&skewed_vk).unwrap()
+    );
+    let outcome = proof.verify_with_prime_audit(&skewed_vk, &U);
+    assert!(!outcome.is_success());
+    assert!(
+      outcome.records().len() <= 1,
+      "only the runtime draw may have happened"
+    );
+  }
+
   /// Sanity: the transcript-sampled `p` actually differs from the curve
   /// scalar prime `q`. Asserts the dual-field claim is real on this
   /// engine; the sampling derives `p` from the transcript bytes, so this
@@ -1720,7 +2270,8 @@ mod tests {
       t.absorb(b"comm_w", cw);
     }
     t.absorb(b"comm_q", &U.comm_q);
-    let params_p = <ME as ModEngine>::sample_params(&mut t);
+    let mut log = PrimeAuditLog::with_expected(1).unwrap();
+    let params_p = <ME as ModEngine>::sample_params(&mut t, &mut log).unwrap();
     let params_q = t256_scalar_params();
     // `p` is a transcript-sampled 128-bit prime in a 2-limb carrier; `q`
     // is the 256-bit curve scalar prime. Compare the modulus values as
