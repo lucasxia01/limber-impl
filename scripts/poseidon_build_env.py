@@ -1823,6 +1823,33 @@ def _check_executable(path, target_dir: str) -> dict:
             "sha256": pc.sha256_file(path)}
 
 
+
+def _default_feature_closure(manifest_path, stage: str, code: str) -> list:
+    """Feature names cargo activates for a package built without `--features`: the
+    transitive closure of its `default` feature over plain feature names (dependency
+    activations such as `dep:x` or `x/y` are not feature names of this package)."""
+    if not manifest_path or not os.path.isfile(manifest_path):
+        raise _err(stage, code, "compiler-artifact manifest_path %r is not a file" % (manifest_path,))
+    with open(manifest_path, "rb") as f:
+        try:
+            doc = tomllib.load(f)
+        except tomllib.TOMLDecodeError as exc:
+            raise _err(stage, code, "%s: %s" % (manifest_path, exc)) from None
+    features = doc.get("features") or {}
+    if "default" not in features:
+        return []
+    activated, todo = set(), ["default"]
+    while todo:
+        name = todo.pop()
+        if name in activated:
+            continue
+        activated.add(name)
+        for entry in features.get(name, []):
+            if isinstance(entry, str) and entry in features and not entry.startswith("dep:") \
+                    and "/" not in entry:
+                todo.append(entry)
+    return sorted(activated)
+
 def evidence_build(repo: str, env: dict, target_dir: str, features: list, role: str,
                    timing_schema: dict, dependency_audit: dict | None = None) -> dict:
     """Run the exact evidence command in the closed environment and validate its outputs.
@@ -1899,7 +1926,9 @@ def evidence_build(repo: str, env: dict, target_dir: str, features: list, role: 
         if profile.get(key) != expected:
             raise _err(stage, code, "compiler-artifact profile.%s is %r, expected %r" %
                        (key, profile.get(key), expected))
-    if sorted(artifact.get("features", [])) != sorted(features):
+    expected_features = sorted(set(_default_feature_closure(artifact.get("manifest_path"), stage,
+                                                            code)) | set(features))
+    if sorted(artifact.get("features", [])) != expected_features:
         raise _err(stage, code, "compiler-artifact features %r differ from %r" %
                    (artifact.get("features"), features))
     roots = {"SOURCE": repo, "CARGO_HOME": env["CARGO_HOME"], "ROLE_TARGET": target_dir,
