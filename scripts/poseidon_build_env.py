@@ -987,7 +987,9 @@ def _profile_block(manifest_text: str) -> str:
     while end < len(lines) and not lines[end].lstrip().startswith("["):
         end += 1
     block = lines[start:end]
-    while block and block[-1].strip() == "":
+    # Trailing blank lines and comment-only lines belong to whatever follows the
+    # table (typically the next profile's documentation), not to the block.
+    while block and (block[-1].strip() == "" or block[-1].lstrip().startswith("#")):
         block.pop()
     return "\n".join(block) + "\n"
 
