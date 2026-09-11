@@ -91,11 +91,25 @@ def safe(s):
     return s[:64]
 
 
-def names(group, func, value):
+_TITLES = set()  # one stub process = one Criterion process = one title set
+
+
+def unique_title(title, registry):
+    """Criterion 0.7.0 `ensure_title_unique`: a colliding title gets `" #N"`, N from 2."""
+    unique, counter = title, 2
+    while unique in registry:
+        unique = "%s #%d" % (title, counter)
+        counter += 1
+    registry.add(unique)
+    return unique
+
+
+def names(group, func, value, registry=None):
     full = "%s/%s/%s" % (group, func, value)
+    title = full[:100] + "..." if len(full) > 100 else full
     return {"full_id": full,
             "directory_name": "%s/%s/%s" % (safe(group), safe(func), safe(value)),
-            "title": full[:100] + "..." if len(full) > 100 else full}
+            "title": unique_title(title, _TITLES if registry is None else registry)}
 
 
 def load_config(path, sha):
@@ -282,6 +296,7 @@ def write_criterion(out, cfg, groups, block, k, inst):
 
 
 def form_child(path, sha, d):
+    _TITLES.clear()  # a fresh Criterion process starts with an empty title set
     cc, why = load_config(path, sha)
     if cc is None:
         return usage(why)

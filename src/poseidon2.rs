@@ -117,12 +117,12 @@ pub mod ids {
   pub const TIMING_SCHEMA_PATH: &str = "specs/poseidon/timing-schema-v2.json";
   /// SHA-256 of the exact bytes of [`TIMING_SCHEMA_PATH`].
   pub const TIMING_SCHEMA_ID: &str =
-    "d859a6be45e0b18dc913f4e427f2283849f3567cb757c9af9f9e41eea7fc4fbe";
+    "230b67ea17daf8d4628d60fd1e92837c56d43ddb233258b140f2fa341746db62";
   /// Path of the shared TUNE-1 tuning protocol, relative to the crate root.
   pub const TUNING_PROTOCOL_PATH: &str = "specs/poseidon/tuning-protocol-v2.json";
   /// SHA-256 of the exact bytes of [`TUNING_PROTOCOL_PATH`].
   pub const TUNING_PROTOCOL_ID: &str =
-    "645a7efa9c3cc707eaa2f33a4886416d26250544acd1f6b5fc7325e2a0519897";
+    "0acdf0a9a1fb5a1bead79242f85c91dac3aea4859b3e5d9351323554d375fac3";
   /// Path of the shared cross-system comparison schema, relative to the
   /// crate root.
   pub const COMPARISON_SCHEMA_PATH: &str = "specs/poseidon/comparison-schema-v2.json";
@@ -2003,7 +2003,7 @@ mod tests {
 
   // -------------------------------------------------------------------------
   // Cross-system gates (Zinc plan v10 §9): the runner executes exactly
-  // `cargo test --locked --offline --release --color never --lib -vv -- --exact poseidon2::tests::kat_gate`
+  // `cargo test --locked --offline --color never --lib -vv -- --exact poseidon2::tests::kat_gate`
   // and `... --exact poseidon2::tests::tuning_corpus_gate`.
 
   /// A crate-relative data path.

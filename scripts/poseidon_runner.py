@@ -397,7 +397,7 @@ def gate_record(ctx: Context, name: str) -> dict:
     execution fields are null until the gate runs."""
     return {"status": "not_run", "argv": ctx.normalize_argv([ctx.cargo()] +
                                                              pc.gate_command(name)[1:]),
-            "profile": "release", "features": [],
+            "profile": "dev", "features": [],
             "target_audit_id": ctx.target_audit["audit_id"],
             "dependency_source_id": ctx.dep_audit["dependency_source_id"],
             "start_utc": None, "end_utc": None, "exit": None, "signal": None,

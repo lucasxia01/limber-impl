@@ -265,7 +265,7 @@ class SweepTests(RunnerTestBase):
             self.assertEqual(g["argv"], ["<SYSROOT>/bin/cargo"] + pc.gate_command(name)[1:])
             self.assertIn("--lib", g["argv"])
             self.assertEqual(g["argv"][-1], pc.GATE_TEST_NAMES[name])
-            self.assertEqual((g["profile"], g["features"], g["exit"]), ("release", [], 0))
+            self.assertEqual((g["profile"], g["features"], g["exit"]), ("dev", [], 0))
             self.assertTrue(g["test_summary"]["passed"])
             self.assertEqual(g["dependency_source_id"],
                              cfgj["dependency_sources"]["dependency_source_id"])

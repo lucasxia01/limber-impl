@@ -161,10 +161,10 @@ class CommandTests(unittest.TestCase):
                          ["--child-config", "/c", "--child-config-sha256", "b" * 64,
                           "--artifact-dir", "/d"])
         self.assertEqual(" ".join(pc.gate_command("kat")),
-                         "cargo test --locked --offline --release --color never --lib -vv -- "
+                         "cargo test --locked --offline --color never --lib -vv -- "
                          "--exact poseidon2::tests::kat_gate")
         self.assertEqual(" ".join(pc.gate_command("tune_corpus")),
-                         "cargo test --locked --offline --release --color never --lib -vv -- "
+                         "cargo test --locked --offline --color never --lib -vv -- "
                          "--exact poseidon2::tests::tuning_corpus_gate")
         for cmd in (pc.bench_prefix([]), pc.evidence_command([]), pc.gate_command("kat")):
             self.assertNotIn("-p", cmd)
@@ -429,3 +429,18 @@ class CriterionGrammarTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CriterionTitleTests(unittest.TestCase):
+    def test_collision_suffix_accepted(self):
+        base = "steps/zincplus/qz/mixed3/Hpf10-total30/nvars10/deg3/wcols72/fl4/square/inst0/thr1/chk0/diagnostic/blkdiag/prover_step_0"
+        exp = pc.criterion_names("steps", base[len("steps/"):].rsplit("/", 1)[0], "prover_step_0")["title"]
+        self.assertTrue(pc.criterion_title_matches(exp, exp))
+        self.assertTrue(pc.criterion_title_matches(exp, exp + " #2"))
+        self.assertTrue(pc.criterion_title_matches(exp, exp + " #17"))
+        self.assertFalse(pc.criterion_title_matches(exp, exp + " #1"))
+        self.assertFalse(pc.criterion_title_matches(exp, exp + " #02"))
+        self.assertFalse(pc.criterion_title_matches(exp, exp + "#2"))
+        self.assertFalse(pc.criterion_title_matches(exp, exp + " #2x"))
+        self.assertFalse(pc.criterion_title_matches(exp, "other"))
+

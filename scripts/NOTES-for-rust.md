@@ -214,8 +214,8 @@ evidence : cargo bench --locked --offline --profile bench --color never --messag
 metadata : cargo bench --locked --offline --profile bench --color never --bench poseidon_modp -vv -- --print-protocol-metadata
 preflight: cargo bench --locked --offline --profile bench --color never --bench poseidon_modp -vv -- --run-config <abs> --config-sha256 <hex> --attempt preflight --artifact-dir <abs>
 child    : cargo bench --locked --offline --profile bench --color never --bench poseidon_modp -vv -- --child-config <abs> --child-config-sha256 <hex> --artifact-dir <abs>
-kat gate : cargo test --locked --offline --release --color never --lib -vv -- --exact poseidon2::tests::kat_gate
-corpus   : cargo test --locked --offline --release --color never --lib -vv -- --exact poseidon2::tests::tuning_corpus_gate
+kat gate : cargo test --locked --offline --color never --lib -vv -- --exact poseidon2::tests::kat_gate
+corpus   : cargo test --locked --offline --color never --lib -vv -- --exact poseidon2::tests::tuning_corpus_gate
 bootstrap: cargo metadata --locked --offline --format-version 1 --filter-platform <host>
 ```
 

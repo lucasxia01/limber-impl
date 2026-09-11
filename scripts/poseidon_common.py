@@ -217,9 +217,9 @@ REQUIRE_BUNDLED_ZSTD = False
 CARGO_BENCH_COMMON = ["bench", "--locked", "--offline", "--profile", "bench", "--color", "never"]
 METADATA_ARGS = ["--", "--print-protocol-metadata"]
 GATE_COMMANDS = {
-    "kat": ["cargo", "test", "--locked", "--offline", "--release", "--color", "never", "--lib",
+    "kat": ["cargo", "test", "--locked", "--offline", "--color", "never", "--lib",
             "-vv", "--", "--exact", "poseidon2::tests::kat_gate"],
-    "tune_corpus": ["cargo", "test", "--locked", "--offline", "--release", "--color", "never",
+    "tune_corpus": ["cargo", "test", "--locked", "--offline", "--color", "never",
                     "--lib", "-vv", "--", "--exact", "poseidon2::tests::tuning_corpus_gate"],
 }
 GATE_ORDER = ("kat", "tune_corpus")
@@ -944,6 +944,18 @@ def criterion_filename_safe(component: str) -> str:
     return out
 
 
+def criterion_title_matches(expected: str, actual: str) -> bool:
+    """Criterion keeps titles unique per process: a title that collides with an earlier
+    registration gets the suffix `" #N"` (N >= 2, `report.rs::ensure_title_unique`)."""
+    if actual == expected:
+        return True
+    prefix = expected + " #"
+    if not actual.startswith(prefix):
+        return False
+    suffix = actual[len(prefix):]
+    return suffix.isdigit() and suffix == str(int(suffix)) and int(suffix) >= 2
+
+
 def criterion_names(group_id: str, function_id: str, value_str: str) -> dict:
     """`full_id`, `directory_name` and `title` as Criterion 0.7.0 derives them."""
     full_id = "%s/%s/%s" % (group_id, function_id, value_str)
@@ -1059,6 +1071,7 @@ def validate_criterion_tree(criterion_root: str, expectation: dict) -> list:
     records = []
     seen_groups = set()
     seen_ids = set()
+    seen_titles = set()
     for id_dir in sorted(by_dir):
         if by_dir[id_dir] != expected_leaves:
             raise err("directory %r has leaf set %s, expected the eight canonical files" %
@@ -1081,9 +1094,15 @@ def validate_criterion_tree(criterion_root: str, expectation: dict) -> list:
         if bench.get("throughput") is not None:
             raise err("%s: throughput must be null" % id_dir)
         names = criterion_names(bench["group_id"], bench["function_id"], bench["value_str"])
-        for key in ("full_id", "directory_name", "title"):
+        for key in ("full_id", "directory_name"):
             if bench[key] != names[key]:
                 raise err("%s: %s is %r, expected %r" % (id_dir, key, bench[key], names[key]))
+        if not criterion_title_matches(names["title"], bench["title"]):
+            raise err("%s: title is %r, expected %r (optionally followed by Criterion's "
+                      "collision suffix \" #N\")" % (id_dir, bench["title"], names["title"]))
+        if bench["title"] in seen_titles:
+            raise err("duplicate title %r" % bench["title"])
+        seen_titles.add(bench["title"])
         expected_dir = "/".join(c for c in names["directory_name"].split("/") if c)
         if id_dir != expected_dir:
             raise err("directory %r does not match directory_name %r" %
