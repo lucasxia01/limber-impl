@@ -1,7 +1,7 @@
 # Limber: Low Overhead SNARKs for Integers
 
 In this repo, we build SNARKs for Integers over Mod R1CS, where constraints support arbitrary modular arithmetic.
-It implements the protocol from the accompanying paper [*Limber: Low Overhead SNARKs for Integers from Any PCS*](https://eprint.iacr.org/2026/1635).
+It implements the protocol from the accompanying paper Limber: Low Overhead SNARKs for Integers from Any PCS.
 
 This repo is forked from [Microsoft Spartan2](https://github.com/Microsoft/Spartan2), and we accordingly build Limber-Spartan with various choices of underlying PCS, including Hyrax and Brakedown.
 
@@ -201,7 +201,7 @@ This runs the pair of benchmarks (`cargo bench --bench imod_spartan_modp -- mssh
 We get 5.9–8.1× prover overhead over plain Spartan at $2^{10}\text{–}2^{14}$ constraints, verify is under 30 ms vs 15–17 ms, proof is 135–149 KB vs ~68 KB.
 
 ## References
-[Limber: Low Overhead SNARKs for Integers from Any PCS](https://eprint.iacr.org/2026/1635) — the protocol this repository implements.
+Limber: Low Overhead SNARKs for Integers from Any PCS — the protocol this repository implements.
 
 [Spartan: Efficient and general-purpose zkSNARKs without trusted setup](https://eprint.iacr.org/2019/550) \
 Srinath Setty \
