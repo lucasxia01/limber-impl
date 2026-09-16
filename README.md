@@ -177,7 +177,7 @@ BDPCS=1 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench
 
 This instantiation defaults to `k = 11` (faster than `k = 9` for the hash backend); override with `BDK=<k>`.
 
-**Arkworks/Garuda baseline row**: measured with an external harness, [`bbuenz/rsa-exp-snark`](https://github.com/bbuenz/rsa-exp-snark) (GR1CS `RsaExpCircuit` via r1cs-std emulated field arithmetic; Garuda/Pari from [`alireza-shirzad/garuda-pari`](https://github.com/alireza-shirzad/garuda-pari), BLS12-381).
+**Arkworks/Garuda baseline row**: measured with an external harness, (GR1CS `RsaExpCircuit` via r1cs-std emulated field arithmetic; Garuda/Pari from [`alireza-shirzad/garuda-pari`](https://github.com/alireza-shirzad/garuda-pari), BLS12-381).
 The circuit contains ~25.2M constraints; reproducing the full-size row needs ~14 GB of RAM (single-threaded: keygen ~904 s, prove ~231 s, verify ~25 ms, proof 7.2 KB).
 
 **Zinc+ row**:
