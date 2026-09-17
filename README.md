@@ -124,21 +124,21 @@ the serialized eval argument so its compressed size can be measured
 All numbers are single-threaded (`RAYON_NUM_THREADS=1`) on a MacBook (Apple M4 Pro, 24 GB RAM, 14 cores); all baselines were re-run on the same machine.
 
 ### MultiSwap benchmark
-The MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) benchmark is two RSA accumulator updates (4 Wesolowski exponentiations with 352-bit exponents modulo an RSA-2048 modulus) plus a Poseidon-based hash-to-prime evaluation.
+The MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) benchmark is two RSA accumulator updates (4 Wesolowski exponentiations with 322-bit exponents modulo an RSA-2048 modulus) plus a Poseidon-based hash-to-prime evaluation.
 
 Constraint counts for Limber are integer gates; [Zinc+](https://eprint.iacr.org/2026/855)'s is the size of its execution trace; the others are ordinary R1CS constraints over a prime field.
 The two circuit rows are proven with the same Spartan prover as Limber (Hyrax over BLS12-381, the field of both circuits), so the comparison isolates the arithmetization. Proof sizes are zstd-compressed.
 
 | System | Constraints | Prove | Verify | Proof size |
 | --- | ---: | ---: | ---: | ---: |
-| Arkworks circuit (emulated field arithmetic) + Spartan | 26.4 M | 68.0 s | 7.27 s | 857 KB |
-| MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) circuit (xJsnark techniques) + Spartan | 10.7 M | 29.0 s | 3.9 s | 463 KB |
-| [Zinc+](https://eprint.iacr.org/2026/855) (full statement ported to their framework) | 2^11 × 248 trace | 9.85 s | 347 ms | 0.94 MB |
+| Arkworks circuit (emulated field arithmetic) + Spartan | 26.4 M | 63.7 s | 5.74 s | 857 KB |
+| MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) circuit (xJsnark techniques) + Spartan | 10.7 M | 31.5 s | 4.30 s | 463 KB |
+| [Zinc+](https://eprint.iacr.org/2026/855) (full computation ported to their framework) | 2^11 × 248 trace | 10.2 s | 363 ms | 0.94 MB |
 | **Limber-Spartan (Hyrax)** | 12,796 | **2.11 s** | **64 ms** | **273 KB** |
-| **Limber-Spartan (Brakedown)** | 12,796 | **2.16 s** | **55 ms** | 8.2 MB |
+| **Limber-Spartan (Brakedown)** | 12,796 | **2.07 s** | **59 ms** | 8.2 MB |
 
-Limber's Hyrax prover is 14× faster than the MultiSwap circuit and 32× faster than the Arkworks circuit under the same Spartan prover.
-Against Zinc+, the Hyrax prover is 4.7× faster, the verifier 5.4× faster, and the proof 3.4× smaller (273 KB vs. 0.94 MB).
+Limber's Hyrax prover is 15× faster than the MultiSwap circuit and 30× faster than the Arkworks circuit under the same Spartan prover.
+Against Zinc+, the Hyrax prover is 4.8× faster, the verifier 5.8× faster, and the proof 3.4× smaller (273 KB vs. 0.94 MB).
 
 ### Poseidon2 benchmark
 Thirty Poseidon2 compressions (t = 3, α = 5, R_F = 8, R_P = 56) over three different non-native prime fields in one proof: three independent ten-hash chains over BN254-Fr, BLS12-381-Fr, and secp256k1-Fr.
@@ -146,12 +146,12 @@ The circuit baseline uses a limb-emulated field gadget (`bellpepper-emulated`, 4
 
 | System | Constraints | Prove | Verify | Proof size |
 | --- | ---: | ---: | ---: | ---: |
-| Emulated-field circuit + Spartan | 9.45 M | 12.4 s | 1.52 s | 340 KB |
-| [Zinc+](https://eprint.iacr.org/2026/855) (Poseidon2 UAIR in their framework) | 2^10 × 72 trace | 544 ms | 31.0 ms | 3.4 MB |
-| **Limber-Spartan (Hyrax)** | 12,990 | **436 ms** | **27.5 ms** | **136 KB** |
-| **Limber-Spartan (Brakedown)** | 12,990 | **335 ms** | 36.2 ms | 3.8 MB |
+| Emulated-field circuit + Spartan | 9.45 M | 10.6 s | 1.53 s | 340 KB |
+| [Zinc+](https://eprint.iacr.org/2026/855) (Poseidon2 UAIR in their framework) | 2^10 × 72 trace | 528 ms | 29.8 ms | 3.4 MB |
+| **Limber-Spartan (Hyrax)** | 12,990 | **438 ms** | **24.7 ms** | **136 KB** |
+| **Limber-Spartan (Brakedown)** | 12,990 | **334 ms** | 33.0 ms | 3.8 MB |
 
-Limber's Hyrax prover is 28× faster than the circuit baseline with a 55× faster verifier and a 2.5× smaller proof, and 1.2× (1.6× with Brakedown) faster than Zinc+ with a comparable verifier and a 25× smaller proof.
+Limber's Hyrax prover is 24× faster than the circuit baseline with a 62× faster verifier and a 2.5× smaller proof, and 1.2× (1.6× with Brakedown) faster than Zinc+ with a 1.2× faster verifier and a 25× smaller proof.
 
 ### Non-native overhead relative to native constraints
 This experiment compares Limber against a plain-Spartan baseline with the same constraint and variable counts.
@@ -160,11 +160,11 @@ Prover time includes witness generation and commitment.
 
 | Constraints | Prove (Limber) | Prove (Spartan) | Ratio | Verify (Limber) | Verify (Spartan) | Ratio |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2^10 | 111 ms | 18.7 ms | 6× | 26.3 ms | 14.5 ms | 1.8× |
-| 2^12 | 225 ms | 45.5 ms | 5× | 28.1 ms | 15.1 ms | 1.9× |
-| 2^14 | 677 ms | 95.0 ms | 7× | 26.7 ms | 16.4 ms | 1.6× |
-| 2^16 | 2.53 s | 295 ms | 9× | 55.6 ms | 22.6 ms | 2.5× |
-| 2^18 | 10.3 s | 1.09 s | 9× | 171 ms | 47.6 ms | 3.6× |
+| 2^10 | 113 ms | 18.0 ms | 6× | 27.8 ms | 13.9 ms | 2.0× |
+| 2^12 | 235 ms | 43.5 ms | 5× | 29.4 ms | 14.5 ms | 2.0× |
+| 2^14 | 699 ms | 92.8 ms | 8× | 27.8 ms | 16.1 ms | 1.7× |
+| 2^16 | 2.58 s | 291 ms | 9× | 56.7 ms | 22.6 ms | 2.5× |
+| 2^18 | 10.1 s | 1.08 s | 9× | 158 ms | 48.8 ms | 3.2× |
 
 We demonstrate a low (5–9×) prover overhead for large 256-bit non-native gates compared to proving completely native constraints. Both provers are linear in the constraint count; the ratio rises with size because plain Spartan's fixed costs amortize faster.
 
@@ -174,7 +174,7 @@ All numbers quoted in the paper are **single-threaded** (`RAYON_NUM_THREADS=1`) 
 
 ### MultiSwap table (Table 1 of the paper)
 
-Both of the Limber rows prove the full OWWB20 computation (`MSCFG=full`, the default): the 4 fully wired Wesolowski exponentiations with 352-bit exponents mod an RSA-2048 modulus, the Poseidon hashes, and the Pocklington hash-to-prime certificate resulting in 12,796 integer constraints, padded to $2^{14}$. Set `PSDUMP=<path>` with `PSIZE=1` to write the proof bytes for compression.
+Both of the Limber rows prove the full OWWB20 computation (`MSCFG=full`, the default): the 4 fully wired Wesolowski exponentiations with 322-bit exponents mod an RSA-2048 modulus, the Poseidon hashes, and the Pocklington hash-to-prime certificate resulting in 12,796 integer constraints, padded to $2^{14}$. Set `PSDUMP=<path>` with `PSIZE=1` to write the proof bytes for compression.
 
 **Hyrax row**:
 
@@ -199,8 +199,8 @@ This instantiation defaults to `k = 11` (faster than `k = 9` for the hash backen
 We ported the circuit into Zinc+'s framework ([`NethermindEth/zinc-plus`](https://github.com/NethermindEth/zinc-plus), `main-beta`) as a 2^11-row, 248-column trace with one modular multiplication per row, and ran their folded prover at code rate 1/8 and 114-bit security:
 
 ```bash
-FULL=1 NVARS=11 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" \
-  cargo bench --bench e2e --features "simd unchecked iprs-rate-1-8 sec-114"
+FULL=1 FOLD=1 NVARS=11 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" \
+  cargo bench --bench limber_multiswap --features "simd unchecked iprs-rate-1-8 sec-114"
 ```
 
 ### Poseidon2 table (Table 4 of the paper)
@@ -212,7 +212,7 @@ RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" scripts/run_poseidon_bench.
 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" scripts/run_poseidon_spartan_bench.sh  # circuit baseline; PSIZE=1 for the proof size
 ```
 
-Both use k = 9. The Zinc+ row is their `poseidon` bench (`qz` variant, 256-bit sampled prime, square shape; with a 320-bit prime: 568 ms / 33.2 ms / 3.1 MB) built with `--features simd` at commit `334f09e` of our fork of `zinc-plus`.
+Both use k = 9. The Zinc+ row is their `poseidon` bench (`qz` variant, 256-bit sampled prime, square shape; with a 320-bit prime: 546 ms / 32.3 ms / 3.1 MB) built with `--features simd` at commit `334f09e` of our fork of `zinc-plus`.
 
 ### Native-overhead figure (Figure 3 of the paper)
 We use Limber-Spartan with Hyrax in this comparison. To generate the data and plots, run:
@@ -222,7 +222,7 @@ RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
 ```
 
 This runs the pair of benchmarks (`cargo bench --bench imod_spartan_modp -- msshape` vs `cargo bench --bench spartan_synthetic -- msshape`) and renders the figures via `scripts/plot_msshape.py`.
-We get 5–9× prover overhead over plain Spartan at $2^{10}\text{–}2^{18}$ constraints; verify is under 30 ms vs 14–16 ms up to $2^{14}$ and 171 ms vs 48 ms at $2^{18}$. Proof size is 125–162 KB vs ~68 KB up to $2^{14}$.
+We get 5–9× prover overhead over plain Spartan at $2^{10}\text{–}2^{18}$ constraints; verify is under 30 ms vs 14–16 ms up to $2^{14}$ and 158 ms vs 49 ms at $2^{18}$.
 
 ## References
 Limber: Low Overhead SNARKs for Integers from Any PCS — the protocol this repository implements.
