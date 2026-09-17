@@ -38,17 +38,17 @@ What remains is proving $y = f_{\mathsf{limb}}(\vec{r'})$ over the integers, whi
 
 ### Parameters
 
-The benchmarks below use the following parameters (Table 4 of the paper):
+The benchmarks below use the following parameters (the IntEval parameters table in the paper):
 
 | Parameter | Hyrax | Brakedown | Meaning |
 | --- | ---: | ---: | --- |
 | $q$ | $\approx 2^{256}$ | $\approx 2^{256}$ | Field characteristic of the underlying PCS (Tom-256 scalar field) |
 | $T$ | $2^{64}$ | $2^{64}$ | Limb base bound; every limb of $f_{\mathsf{limb}}$ is range-checked to $[0, T)$ |
 | $k$ | $9$ | $11$ | Variables partially evaluated per IntEval layer; each layer shrinks by $2^{k}$ |
-| $s$ | $16$ | $31$ | Number of small CRT primes $`p_i`$ sampled by the IntEval verifier |
+| $s$ | $16$ | $31$ | Number of small CRT primes $p_i$ sampled by the IntEval verifier |
 | Commitment overhead | $\approx 0.13\times$ | $\approx 0.07\times$ | Extra committed data relative to the witness |
 
-The values shown are for the MultiSwap benchmark ($`T_f = 2^{2048}`$, $N = 2^{14}$ rows). The plain Spartan comparison ($`T_f = 2^{256}`$, $N = 2^{10} \text{-} 2^{18}$) and the Poseidon2 benchmark ($`T_f = 2^{256}`$, $N = 2^{14}$) use $k = 9$ for both backends and derive the same $s = 15\text{–}16$ and 20-bit CRT primes.
+The values shown are for the MultiSwap benchmark, with $T_f = 2^{2048}$ and $N = 2^{14}$ rows. The plain Spartan comparison, with $T_f = 2^{256}$ and $N = 2^{10}$ to $2^{18}$, and the Poseidon2 benchmark, with $T_f = 2^{256}$ and $N = 2^{14}$, use $k = 9$ for both backends and derive the same $s = 15\text{–}16$ and 20-bit CRT primes.
 
 $s$ and the commitment overhead are derived from the other three parameters and the polynomial size (`IntEvalParams::derive`).
 Larger $k$ lowers the commitment overhead at the cost of more CRT primes. See the paper for more details.
@@ -61,6 +61,9 @@ Larger $k$ lowers the commitment overhead at the cost of more CRT primes. See th
 - `src/logup_gkr.rs` — batched LogUp-GKR range check for the limbs and decomposed polynomials in IntEval.
 - `src/dyn_prime.rs`, `src/sumcheck_modp.rs`, `src/polys_modp/` — runtime-modulus field for the Fiat–Shamir-sampled prime $p$, and the sumcheck/polynomial code running over it.
 - `src/imod_spartan_modp.rs` — the SNARK driver tying the Spartan-style mod-PIOP to the mod-PCS; trait surface in `src/traits/mod_engine.rs`.
+- `src/prime_sampler.rs` — the audited transcript sampler for the fingerprinting prime $p$ and the IntEval primes $p_i$.
+- `src/multiswap/` — the MultiSwap workload as an Integer Mod-R1CS circuit (RSA accumulator, Poseidon and MiMC gadgets, Pocklington hash-to-prime certificate).
+- `src/poseidon2.rs`, `src/poseidon2_spartan/` — the three-field Poseidon2 workload as an Integer Mod-R1CS circuit, and its limb-emulated plain-Spartan baseline.
 
 ## Building and testing
 
@@ -92,6 +95,7 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --bench <name>
 | `poseidon_modp` | 30 Poseidon2 compressions over three non-native fields (BN254-Fr, BLS12-381-Fr, secp256k1-Fr) in one Limber circuit, Hyrax or Brakedown. Driven by a run-config file rather than env knobs: see `scripts/run_poseidon_bench.sh` |
 | `poseidon_spartan` | The same Poseidon2 workload as a limb-emulated circuit under plain Spartan, the circuit-based baseline: `scripts/run_poseidon_spartan_bench.sh` |
 | `logup_gkr` | LogUp-GKR range proof in isolation |
+| `imod_spartan`, `sha256_spartan` | Earlier Spartan-side benches (Integer Mod-R1CS over the curve field without fingerprinting; a SHA-256 circuit); not used in the paper |
 | `int_mult` (example) | A wired chain of w-bit integer multiplications; `cargo run --release --example int_mult -- --bits 64 --log-gates 16` (see below) |
 
 ### Quick start: w-bit integer multiplication
@@ -108,12 +112,11 @@ RUSTFLAGS="-C target-cpu=native" RAYON_NUM_THREADS=1 \
 ```
 
 It prints the derived parameters, per-phase times (setup, witness
-generation, commit+prove, verify), and the proof size. Witness generation
-is timed separately so the commit+prove line is comparable to systems
-that exclude it from prover time. `DUMP=<path>` writes the serialized
-eval argument so its compressed size can be measured (`zstd -19`);
-Limber proofs compress by only ~2% — they are elliptic-curve points and
-field elements, already information-dense.
+generation, commit+prove, verify), and the proof size. Prover time
+includes witness generation, as in all our benchmarks; the example
+reports the two parts separately and their total. `DUMP=<path>` writes
+the serialized eval argument so its compressed size can be measured
+(`zstd -19`).
 
 
 ## Results
@@ -171,7 +174,7 @@ All numbers quoted in the paper are **single-threaded** (`RAYON_NUM_THREADS=1`) 
 
 ### MultiSwap table (Table 1 of the paper)
 
-Both of the Limber rows prove the full OWWB20 computation (`MSCFG=full`, the default): the 4 fully wired Wesolowski exponentiations with 352-bit exponents mod an RSA-2048 modulus, the Poseidon hashes, and the Pocklington hash-to-prime certificate resulting in 12,796 (padded to $2^{14}$) integer constraints. Set `PSDUMP=<path>` with `PSIZE=1` to write the proof bytes for compression.
+Both of the Limber rows prove the full OWWB20 computation (`MSCFG=full`, the default): the 4 fully wired Wesolowski exponentiations with 352-bit exponents mod an RSA-2048 modulus, the Poseidon hashes, and the Pocklington hash-to-prime certificate resulting in 12,796 integer constraints, padded to $2^{14}$. Set `PSDUMP=<path>` with `PSIZE=1` to write the proof bytes for compression.
 
 **Hyrax row**:
 
@@ -200,7 +203,7 @@ FULL=1 NVARS=11 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" \
   cargo bench --bench e2e --features "simd unchecked iprs-rate-1-8 sec-114"
 ```
 
-### Poseidon2 table (Table 2 of the paper)
+### Poseidon2 table (Table 4 of the paper)
 
 The Limber rows come from the `poseidon_modp` bench and the baseline from `poseidon_spartan`; both are driven by an immutable run-config file rather than environment knobs, through the wrapper scripts:
 
@@ -219,7 +222,7 @@ RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
 ```
 
 This runs the pair of benchmarks (`cargo bench --bench imod_spartan_modp -- msshape` vs `cargo bench --bench spartan_synthetic -- msshape`) and renders the figures via `scripts/plot_msshape.py`.
-We get 5–9× prover overhead over plain Spartan at $2^{10}\text{–}2^{18}$ constraints; verify is under 30 ms vs 14–16 ms up to $2^{14}$ (171 ms vs 48 ms at $2^{18}$); proof is 125–162 KB vs ~68 KB up to $2^{14}$.
+We get 5–9× prover overhead over plain Spartan at $2^{10}\text{–}2^{18}$ constraints; verify is under 30 ms vs 14–16 ms up to $2^{14}$ and 171 ms vs 48 ms at $2^{18}$. Proof size is 125–162 KB vs ~68 KB up to $2^{14}$.
 
 ## References
 Limber: Low Overhead SNARKs for Integers from Any PCS — the protocol this repository implements.
