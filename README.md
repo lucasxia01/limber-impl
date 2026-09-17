@@ -137,6 +137,19 @@ The two circuit rows are proven with the same Spartan prover as Limber (Hyrax ov
 Limber's Hyrax prover is 14× faster than the MultiSwap circuit and 32× faster than the Arkworks circuit under the same Spartan prover.
 Against Zinc+, the Hyrax prover is 4.7× faster, the verifier 5.4× faster, and the proof 3.4× smaller (273 KB vs. 0.94 MB).
 
+### Poseidon2 benchmark
+Thirty Poseidon2 compressions (t = 3, α = 5, R_F = 8, R_P = 56) over three different non-native prime fields in one proof: three independent ten-hash chains over BN254-Fr, BLS12-381-Fr, and secp256k1-Fr.
+The circuit baseline uses a limb-emulated field gadget (`bellpepper-emulated`, 4 × 64-bit limbs) and is proven with the same Spartan prover as Limber (Hyrax over Tom-256).
+
+| System | Constraints | Prove | Verify | Proof size |
+| --- | ---: | ---: | ---: | ---: |
+| Emulated-field circuit + Spartan | 9.45 M | 12.4 s | 1.52 s | 340 KB |
+| [Zinc+](https://eprint.iacr.org/2026/855) (Poseidon2 UAIR in their framework) | 2^10 × 72 trace | 544 ms | 31.0 ms | 3.4 MB |
+| **Limber-Spartan (Hyrax)** | 12,990 | **436 ms** | **27.5 ms** | **136 KB** |
+| **Limber-Spartan (Brakedown)** | 12,990 | **335 ms** | 36.2 ms | 3.8 MB |
+
+Limber's Hyrax prover is 28× faster than the circuit baseline with a 55× faster verifier and a 2.5× smaller proof, and 1.2× (1.6× with Brakedown) faster than Zinc+ with a comparable verifier and a 25× smaller proof.
+
 ### Non-native overhead relative to native constraints
 This experiment compares Limber against a plain-Spartan baseline with the same constraint and variable counts.
 Each Limber gate is a random multiplication modulo the Tom-256 **base-field** modulus; the baseline proves native **scalar-field** gates.
@@ -187,6 +200,17 @@ FULL=1 NVARS=11 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" \
   cargo bench --bench e2e --features "simd unchecked iprs-rate-1-8 sec-114"
 ```
 
+### Poseidon2 table (Table 2 of the paper)
+
+The Limber rows come from the `poseidon_modp` bench and the baseline from `poseidon_spartan`; both are driven by an immutable run-config file rather than environment knobs, through the wrapper scripts:
+
+```bash
+RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" scripts/run_poseidon_bench.sh          # Limber, BACKEND=hyrax|brakedown
+RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" scripts/run_poseidon_spartan_bench.sh  # circuit baseline; PSIZE=1 for the proof size
+```
+
+Both use k = 9. The Zinc+ row is their `poseidon` bench (`qz` variant, 256-bit sampled prime, square shape; with a 320-bit prime: 568 ms / 33.2 ms / 3.1 MB) built with `--features simd` at commit `334f09e` of our fork of `zinc-plus`.
+
 ### Native-overhead figure (Figure 3 of the paper)
 We use Limber-Spartan with Hyrax in this comparison. To generate the data and plots, run:
 ```bash
@@ -219,48 +243,3 @@ Cryptology ePrint Archive 2026/855
 ## License
 
 MIT, inherited from the upstream [Spartan2](https://github.com/Microsoft/Spartan2) project — see [LICENSE](LICENSE).
-
-<!-- poseidon2-bench:begin -->
-## Poseidon2 non-native-field benchmark
-
-Thirty Poseidon2 compressions (t = 3, α = 5, R_F = 8, R_P = 56) proven in ONE mixed-modulus circuit: three independent ten-compression chains — one per field block, BN254-Fr, BLS12-381-Fr, secp256k1-Fr, in that fixed order — each restarting from the same fixed IV and ending at its own ordered public digest (num_io = 3; 12,990 real rows padded once to 2^14 × 2^14). **This permutation is a benchmark workload, not a security-reviewed production hash** (custom BLAKE3-derived constants). **No zero-knowledge claim is made for this driver**: Hyrax commitments are hiding, Brakedown commitments are not, and the sumcheck transcript carries unmasked witness-dependent data regardless of backend; "messages are private" means *not public IO*, not confidential. Verification must go through `limber::poseidon2::verify_poseidon_chain` — bypassing it forfeits the three-digest canonicality guarantee. Published Brakedown timings are layout-warm steady state with an empty retained cache per measured sample.
-
-| run id | backend | mode | H/field (total) | k | git | config |
-| --- | --- | --- | ---: | ---: | --- | --- |
-| [`20260910T143911Z-cfg-550923735ba7`](bench-results/poseidon2/20260910T143911Z-cfg-550923735ba7/) | hyrax | normal | 10 (30) | 9 | `5a9be0e1dfa1` | `cfg-550923735ba7` |
-| [`20260910T144208Z-cfg-6bde446e6974`](bench-results/poseidon2/20260910T144208Z-cfg-6bde446e6974/) | hyrax | proof_size | 10 (30) | 9 | `5a9be0e1dfa1` | `cfg-6bde446e6974` |
-
-Raw Criterion data, immutable run configs, manifests, and proof-size / k-sweep sidecars live in each run directory. Reproduce with the exact commands in `scripts/run_poseidon_bench.sh` (see plan §12).
-<!-- poseidon2-bench:end -->
-
-<!-- poseidon2-spartan-bench:begin -->
-## Emulated-field baseline (classic Spartan)
-
-The same 30-hash Poseidon2 workload proven as ONE limb-emulated circuit under classic Spartan (`SpartanSNARK<T256HyraxEngine>`, 4 × 64-bit limbs via the revision-pinned `bellpepper-emulated` gadget): 9,454,119 real constraints padded to 2^24, against the ModP circuit's 12,990 rows padded to 2^14. The statement is existence-only, identical to the ModP suite's; **no zero-knowledge claim is made**. The emulated circuit is a good-faith optimized baseline (free linear layers, measured lazy-reduction schedule: two explicit reductions per S-box plus lanes 1–2 every 8th partial round), not a strawman. `prep_prove` is included in the headline `prove_e2e` prover time. Classic Spartan physically serializes the 12 public limb scalars; the comparison payload excludes that statement data by convention, and its component sizes are canonical bincode while the ModP sumcheck remainder is an analytical payload without framing, so proof-size comparisons are not exact wire-format ratios. Hyrax-vs-Hyrax only: ModP Brakedown rows have no counterpart here. Verification must go through `limber::poseidon2_spartan::verify_poseidon_spartan`. This is the measured baseline the ModP plan's §4 declined to estimate.
-
-| run id | mode | H/field (total) | padded | git | config |
-| --- | --- | ---: | --- | --- | --- |
-| [`20260910T140604Z-spartan-cfg-7ed4f9986484`](bench-results/poseidon2-spartan/20260910T140604Z-spartan-cfg-7ed4f9986484/) | normal | 10 (30) | 2^24 × 2^24 | `5a9be0e1dfa1` | `cfg-7ed4f9986484` |
-| [`20260910T143206Z-spartan-cfg-0e29b40d66ad`](bench-results/poseidon2-spartan/20260910T143206Z-spartan-cfg-0e29b40d66ad/) | proof_size | 10 (30) | 2^24 × 2^24 | `5a9be0e1dfa1` | `cfg-0e29b40d66ad` |
-
-Raw Criterion data, immutable run configs, manifests, and the proof-size sidecar live in each run directory. Reproduce with `scripts/run_poseidon_spartan_bench.sh` (see plan/poseidon_spartan_bench.md §6, §10).
-<!-- poseidon2-spartan-bench:end -->
-
-### Limber vs emulated-field baseline: the headline comparison
-
-`H = 10` runs (30 Poseidon2 compressions across BN254-Fr, BLS12-381-Fr,
-secp256k1-Fr), single-threaded, `-C target-cpu=native`, Apple M4 Pro,
-commit `0ac80f9`, 2026-09-16, Criterion medians of 10 samples. The Zinc+
-row is their Poseidon2 UAIR (`qz` variant, 256-bit sampled prime, square
-shape; with a 320-bit prime: 568 ms / 33.2 ms / 3.1 MB). Proof sizes are
-zstd-compressed.
-
-| System | Constraints | Prove | Verify | Proof size |
-| --- | ---: | ---: | ---: | ---: |
-| Emulated-field circuit (bellpepper-emulated) + Spartan | 9.45 M (2^24) | 12.4 s | 1.52 s | 340 KB |
-| [Zinc+](https://eprint.iacr.org/2026/855) | 2^10 × 72 trace | 544 ms | 31.0 ms | 3.4 MB |
-| **Limber-Spartan (Hyrax)** | 12,990 (2^14) | **436 ms** | **27.5 ms** | **136 KB** |
-| **Limber-Spartan (Brakedown)** | 12,990 (2^14) | **335 ms** | 36.2 ms | 3.8 MB |
-
-Limber's Hyrax prover is 28× faster than the emulated-field circuit with a 55× faster verifier and a 2.5× smaller proof, and 1.2× (1.6× with Brakedown) faster than Zinc+ with a comparable verifier and a 25× smaller proof.
-
