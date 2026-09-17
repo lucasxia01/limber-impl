@@ -45,10 +45,10 @@ The benchmarks below use the following parameters (Table 4 of the paper):
 | $q$ | $\approx 2^{256}$ | $\approx 2^{256}$ | Field characteristic of the underlying PCS (Tom-256 scalar field) |
 | $T$ | $2^{64}$ | $2^{64}$ | Limb base bound; every limb of $f_{\mathsf{limb}}$ is range-checked to $[0, T)$ |
 | $k$ | $9$ | $11$ | Variables partially evaluated per IntEval layer; each layer shrinks by $2^{k}$ |
-| $s$ | $16$ | $30$ | Number of small CRT primes $p_i$ sampled by the IntEval verifier |
+| $s$ | $16$ | $31$ | Number of small CRT primes $`p_i`$ sampled by the IntEval verifier |
 | Commitment overhead | $\approx 0.13\times$ | $\approx 0.07\times$ | Extra committed data relative to the witness |
 
-The values shown are for the MultiSwap benchmark, with $T_f = 2^{2048}$ and $N = 2^{13}$ rows. The parameters for the plain Spartan comparison, with $T_f = 2^{256}$ and $N = 2^{10}$ to $2^{14}$, are similar.
+The values shown are for the MultiSwap benchmark ($`T_f = 2^{2048}`$, $N = 2^{14}$ rows). The plain Spartan comparison ($`T_f = 2^{256}`$, $N = 2^{10} \text{-} 2^{18}$) and the Poseidon2 benchmark ($`T_f = 2^{256}`$, $N = 2^{14}$) use $k = 9$ for both backends and derive the same $s = 15\text{–}16$ and 20-bit CRT primes.
 
 $s$ and the commitment overhead are derived from the other three parameters and the polynomial size (`IntEvalParams::derive`).
 Larger $k$ lowers the commitment overhead at the cost of more CRT primes. See the paper for more details.
@@ -89,20 +89,18 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --bench <name>
 | `imod_spartan_modp` | Limber-Spartan on various constraint counts |
 | `spartan_synthetic` | Plain-Spartan baseline to compare to Limber |
 | `multiswap_modp` | MultiSwap (RSA-accumulator verification circuit, [OWWB20](https://eprint.iacr.org/2019/1494)). `BDPCS=1` runs the Brakedown instantiation instead of Hyrax |
+| `poseidon_modp` | 30 Poseidon2 compressions over three non-native fields (BN254-Fr, BLS12-381-Fr, secp256k1-Fr) in one Limber circuit, Hyrax or Brakedown. Driven by a run-config file rather than env knobs: see `scripts/run_poseidon_bench.sh` |
+| `poseidon_spartan` | The same Poseidon2 workload as a limb-emulated circuit under plain Spartan, the circuit-based baseline: `scripts/run_poseidon_spartan_bench.sh` |
 | `logup_gkr` | LogUp-GKR range proof in isolation |
+| `int_mult` (example) | A wired chain of w-bit integer multiplications; `cargo run --release --example int_mult -- --bits 64 --log-gates 16` (see below) |
 
 ### Quick start: w-bit integer multiplication
 
 To prove a chain of 32- or 64-bit integer multiplications, use the
 `int_mult` example. The circuit is one wired multiplication chain
 `c_i = a_i · b_i mod 2^w` with `a_{i+1} = c_i` (i.e. it proves
-`c = a_0 · Π b_i mod 2^w` for random w-bit operands) — per-gate
-wraparound multiplication with real dataflow, which is free in the
-Mod-R1CS matrices. `--log-gates L` packs `2^L − 1` gates into `2^L`
-constraint rows and `2^(L+1)` witness variables with no padding waste.
-Width and chain length are the only inputs; `log T = log T_f = w`
-(single limb) and `(log P, s)` are derived automatically for λ = 128
-and printed on every run:
+`c = a_0 · Π b_i mod 2^w` for random w-bit operands). `--log-gates L` creates `2^L − 1` gates and `2^(L+1)` witness variables.
+To run the benchmark:
 
 ```bash
 RUSTFLAGS="-C target-cpu=native" RAYON_NUM_THREADS=1 \
@@ -125,19 +123,32 @@ All numbers are single-threaded (`RAYON_NUM_THREADS=1`) on a MacBook (Apple M4 P
 ### MultiSwap benchmark
 The MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) benchmark is two RSA accumulator updates (4 Wesolowski exponentiations with 352-bit exponents modulo an RSA-2048 modulus) plus a Poseidon-based hash-to-prime evaluation.
 
-Constraint counts for [Zinc+](https://eprint.iacr.org/2026/855) and Limber are integer gates; the others are ordinary R1CS constraints over a prime field.
+Constraint counts for Limber are integer gates; [Zinc+](https://eprint.iacr.org/2026/855)'s is the size of its execution trace; the others are ordinary R1CS constraints over a prime field.
+The two circuit rows are proven with the same Spartan prover as Limber (Hyrax over BLS12-381, the field of both circuits), so the comparison isolates the arithmetization. Proof sizes are zstd-compressed.
 
 | System | Constraints | Prove | Verify | Proof size |
 | --- | ---: | ---: | ---: | ---: |
-| Arkworks (emulated field arithmetic + Garuda) | 25.2 M | 231 s | 25 ms | 7.2 KB |
-| MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) (xJsnark techniques + Groth16) | 6.2 M | 88.5 s | 2 ms | 0.2 KB |
-| [Zinc+](https://eprint.iacr.org/2026/855) (concurrent work based on Brakedown) | 6,209 | 2.06 s | 514 ms | 1.2 MB |
-| **Limber-Spartan (Hyrax)** | 6,209 | **1.32 s** | **39 ms** | **170 KB** |
-| **Limber-Spartan (Brakedown)** | 6,209 | **1.18 s** | **45 ms** | 5.3 MB |
+| Arkworks circuit (emulated field arithmetic) + Spartan | 26.4 M | 68.0 s | 7.27 s | 857 KB |
+| MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) circuit (xJsnark techniques) + Spartan | 10.7 M | 29.0 s | 3.9 s | 463 KB |
+| [Zinc+](https://eprint.iacr.org/2026/855) (full statement ported to their framework) | 2^11 × 248 trace | 9.85 s | 347 ms | 0.94 MB |
+| **Limber-Spartan (Hyrax)** | 12,796 | **2.11 s** | **64 ms** | **273 KB** |
+| **Limber-Spartan (Brakedown)** | 12,796 | **2.16 s** | **55 ms** | 8.2 MB |
 
-Limber demonstrates a 175×/196× (Hyrax/Brakedown) prover speedup over Arkworks and 67×/75× over the MultiSwap implementation.
-Against Zinc+, the Hyrax prover is 1.6× faster, the verifier 13× faster, and the proof 7× smaller (170 KB vs. 1.2 MB).
-The Brakedown prover is 1.7× faster and the verifier 11× faster than Zinc+, with a 4.4× larger proof (5.3 MB vs. 1.2 MB).
+Limber's Hyrax prover is 14× faster than the MultiSwap circuit and 32× faster than the Arkworks circuit under the same Spartan prover.
+Against Zinc+, the Hyrax prover is 4.7× faster, the verifier 5.4× faster, and the proof 3.4× smaller (273 KB vs. 0.94 MB).
+
+### Poseidon2 benchmark
+Thirty Poseidon2 compressions (t = 3, α = 5, R_F = 8, R_P = 56) over three different non-native prime fields in one proof: three independent ten-hash chains over BN254-Fr, BLS12-381-Fr, and secp256k1-Fr.
+The circuit baseline uses a limb-emulated field gadget (`bellpepper-emulated`, 4 × 64-bit limbs) and is proven with the same Spartan prover as Limber (Hyrax over Tom-256).
+
+| System | Constraints | Prove | Verify | Proof size |
+| --- | ---: | ---: | ---: | ---: |
+| Emulated-field circuit + Spartan | 9.45 M | 12.4 s | 1.52 s | 340 KB |
+| [Zinc+](https://eprint.iacr.org/2026/855) (Poseidon2 UAIR in their framework) | 2^10 × 72 trace | 544 ms | 31.0 ms | 3.4 MB |
+| **Limber-Spartan (Hyrax)** | 12,990 | **436 ms** | **27.5 ms** | **136 KB** |
+| **Limber-Spartan (Brakedown)** | 12,990 | **335 ms** | 36.2 ms | 3.8 MB |
+
+Limber's Hyrax prover is 28× faster than the circuit baseline with a 55× faster verifier and a 2.5× smaller proof, and 1.2× (1.6× with Brakedown) faster than Zinc+ with a comparable verifier and a 25× smaller proof.
 
 ### Non-native overhead relative to native constraints
 This experiment compares Limber against a plain-Spartan baseline with the same constraint and variable counts.
@@ -146,11 +157,13 @@ Prover time includes witness generation and commitment.
 
 | Constraints | Prove (Limber) | Prove (Spartan) | Ratio | Verify (Limber) | Verify (Spartan) | Ratio |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2^10 | 121 ms | 19.4 ms | 6× | 25.9 ms | 15.1 ms | 1.7× |
-| 2^12 | 270 ms | 46.0 ms | 6× | 28.7 ms | 15.4 ms | 1.9× |
-| 2^14 | 790 ms | 97.7 ms | 8× | 27.5 ms | 17.2 ms | 1.6× |
+| 2^10 | 111 ms | 18.7 ms | 6× | 26.3 ms | 14.5 ms | 1.8× |
+| 2^12 | 225 ms | 45.5 ms | 5× | 28.1 ms | 15.1 ms | 1.9× |
+| 2^14 | 677 ms | 95.0 ms | 7× | 26.7 ms | 16.4 ms | 1.6× |
+| 2^16 | 2.53 s | 295 ms | 9× | 55.6 ms | 22.6 ms | 2.5× |
+| 2^18 | 10.3 s | 1.09 s | 9× | 171 ms | 47.6 ms | 3.6× |
 
-We demonstrate a low (6-8×) prover overhead for large 256-bit non-native gates compared to proving completely native constraints.
+We demonstrate a low (5–9×) prover overhead for large 256-bit non-native gates compared to proving completely native constraints. Both provers are linear in the constraint count; the ratio rises with size because plain Spartan's fixed costs amortize faster.
 
 ## Reproducing the paper's numbers
 
@@ -158,7 +171,7 @@ All numbers quoted in the paper are **single-threaded** (`RAYON_NUM_THREADS=1`) 
 
 ### MultiSwap table (Table 1 of the paper)
 
-Both of the Limber rows prove the MultiSwap computation: 4 fully wired Wesolowski exponentiations with 352-bit exponents mod an RSA-2048 modulus and the hash-to-prime which we model with the right number of gates (~2000).
+Both of the Limber rows prove the full OWWB20 computation (`MSCFG=full`, the default): the 4 fully wired Wesolowski exponentiations with 352-bit exponents mod an RSA-2048 modulus, the Poseidon hashes, and the Pocklington hash-to-prime certificate resulting in 12,796 (padded to $2^{14}$) integer constraints. Set `PSDUMP=<path>` with `PSIZE=1` to write the proof bytes for compression.
 
 **Hyrax row**:
 
@@ -177,18 +190,26 @@ BDPCS=1 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench
 
 This instantiation defaults to `k = 11` (faster than `k = 9` for the hash backend); override with `BDK=<k>`.
 
-**Arkworks/Garuda baseline row**: measured with an external harness, (GR1CS `RsaExpCircuit` via r1cs-std emulated field arithmetic; Garuda/Pari from [`alireza-shirzad/garuda-pari`](https://github.com/alireza-shirzad/garuda-pari), BLS12-381).
-The circuit contains ~25.2M constraints; reproducing the full-size row needs ~14 GB of RAM (single-threaded: keygen ~904 s, prove ~231 s, verify ~25 ms, proof 7.2 KB).
+**Circuit rows (Arkworks, MultiSwap)**: both circuits are exported as R1CS over BLS12-381-Fr and proven with this repo's Spartan prover using Hyrax over BLS12-381. The MultiSwap circuit comes from [`bellman-bignat`](https://github.com/alex-ozdemir/bellman-bignat) `SetBench` (10,658,232 constraints, 322-bit challenges); the Arkworks circuit is a re-implementation of the full computation with r1cs-std emulated field arithmetic (26,445,064 constraints, synthesized in stages and stacked). Proving each needs 13–15 GB of RAM single-threaded.
 
 **Zinc+ row**:
-We compare to Zinc+'s implementation [`NethermindEth/zinc-plus`](https://github.com/NethermindEth/zinc-plus) at commit `7eadc16` and with `crypto-primitives` git dependency pinned to rev `2cf39db8` to fix the build. Under this setup, run:
+We ported the circuit into Zinc+'s framework ([`NethermindEth/zinc-plus`](https://github.com/NethermindEth/zinc-plus), `main-beta`) as a 2^11-row, 248-column trace with one modular multiplication per row, and ran their folded prover at code rate 1/8 and 114-bit security:
 
 ```bash
-RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" \
-  cargo bench --bench e2e --features "parallel simd unchecked iprs-rate-1-8"
+FULL=1 NVARS=11 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" \
+  cargo bench --bench e2e --features "simd unchecked iprs-rate-1-8 sec-114"
 ```
 
-Zinc+ does not benchmark big-integer arithmetic, so the 2048-bit workload is a small custom UAIR — one `a·b ≡ c (mod N)` per row via `assert_zero(a·b − c − k·N)` — written in their framework. We note that this circuit is not properly wired and it does not include the hash-to-prime or bit checking gates for the actual MultiSwap computation.
+### Poseidon2 table (Table 2 of the paper)
+
+The Limber rows come from the `poseidon_modp` bench and the baseline from `poseidon_spartan`; both are driven by an immutable run-config file rather than environment knobs, through the wrapper scripts:
+
+```bash
+RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" scripts/run_poseidon_bench.sh          # Limber, BACKEND=hyrax|brakedown
+RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" scripts/run_poseidon_spartan_bench.sh  # circuit baseline; PSIZE=1 for the proof size
+```
+
+Both use k = 9. The Zinc+ row is their `poseidon` bench (`qz` variant, 256-bit sampled prime, square shape; with a 320-bit prime: 568 ms / 33.2 ms / 3.1 MB) built with `--features simd` at commit `334f09e` of our fork of `zinc-plus`.
 
 ### Native-overhead figure (Figure 3 of the paper)
 We use Limber-Spartan with Hyrax in this comparison. To generate the data and plots, run:
@@ -198,7 +219,7 @@ RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
 ```
 
 This runs the pair of benchmarks (`cargo bench --bench imod_spartan_modp -- msshape` vs `cargo bench --bench spartan_synthetic -- msshape`) and renders the figures via `scripts/plot_msshape.py`.
-We get 5.9–8.1× prover overhead over plain Spartan at $2^{10}\text{–}2^{14}$ constraints, verify is under 30 ms vs 15–17 ms, proof is 135–149 KB vs ~68 KB.
+We get 5–9× prover overhead over plain Spartan at $2^{10}\text{–}2^{18}$ constraints; verify is under 30 ms vs 14–16 ms up to $2^{14}$ (171 ms vs 48 ms at $2^{18}$); proof is 125–162 KB vs ~68 KB up to $2^{14}$.
 
 ## References
 Limber: Low Overhead SNARKs for Integers from Any PCS — the protocol this repository implements.
@@ -222,54 +243,3 @@ Cryptology ePrint Archive 2026/855
 ## License
 
 MIT, inherited from the upstream [Spartan2](https://github.com/Microsoft/Spartan2) project — see [LICENSE](LICENSE).
-
-<!-- poseidon2-bench:begin -->
-## Poseidon2 non-native-field benchmark
-
-Thirty Poseidon2 compressions (t = 3, α = 5, R_F = 8, R_P = 56) proven in ONE mixed-modulus circuit: three independent ten-compression chains — one per field block, BN254-Fr, BLS12-381-Fr, secp256k1-Fr, in that fixed order — each restarting from the same fixed IV and ending at its own ordered public digest (num_io = 3; 12,990 real rows padded once to 2^14 × 2^14). **This permutation is a benchmark workload, not a security-reviewed production hash** (custom BLAKE3-derived constants). **No zero-knowledge claim is made for this driver**: Hyrax commitments are hiding, Brakedown commitments are not, and the sumcheck transcript carries unmasked witness-dependent data regardless of backend; "messages are private" means *not public IO*, not confidential. Verification must go through `limber::poseidon2::verify_poseidon_chain` — bypassing it forfeits the three-digest canonicality guarantee. Published Brakedown timings are layout-warm steady state with an empty retained cache per measured sample.
-
-| run id | backend | mode | H/field (total) | k | git | config |
-| --- | --- | --- | ---: | ---: | --- | --- |
-| [`20260910T143911Z-cfg-550923735ba7`](bench-results/poseidon2/20260910T143911Z-cfg-550923735ba7/) | hyrax | normal | 10 (30) | 9 | `5a9be0e1dfa1` | `cfg-550923735ba7` |
-| [`20260910T144208Z-cfg-6bde446e6974`](bench-results/poseidon2/20260910T144208Z-cfg-6bde446e6974/) | hyrax | proof_size | 10 (30) | 9 | `5a9be0e1dfa1` | `cfg-6bde446e6974` |
-
-Raw Criterion data, immutable run configs, manifests, and proof-size / k-sweep sidecars live in each run directory. Reproduce with the exact commands in `scripts/run_poseidon_bench.sh` (see plan §12).
-<!-- poseidon2-bench:end -->
-
-<!-- poseidon2-spartan-bench:begin -->
-## Emulated-field baseline (classic Spartan)
-
-The same 30-hash Poseidon2 workload proven as ONE limb-emulated circuit under classic Spartan (`SpartanSNARK<T256HyraxEngine>`, 4 × 64-bit limbs via the revision-pinned `bellpepper-emulated` gadget): 9,454,119 real constraints padded to 2^24, against the ModP circuit's 12,990 rows padded to 2^14. The statement is existence-only, identical to the ModP suite's; **no zero-knowledge claim is made**. The emulated circuit is a good-faith optimized baseline (free linear layers, measured lazy-reduction schedule: two explicit reductions per S-box plus lanes 1–2 every 8th partial round), not a strawman. `prep_prove` is included in the headline `prove_e2e` prover time. Classic Spartan physically serializes the 12 public limb scalars; the comparison payload excludes that statement data by convention, and its component sizes are canonical bincode while the ModP sumcheck remainder is an analytical payload without framing, so proof-size comparisons are not exact wire-format ratios. Hyrax-vs-Hyrax only: ModP Brakedown rows have no counterpart here. Verification must go through `limber::poseidon2_spartan::verify_poseidon_spartan`. This is the measured baseline the ModP plan's §4 declined to estimate.
-
-| run id | mode | H/field (total) | padded | git | config |
-| --- | --- | ---: | --- | --- | --- |
-| [`20260910T140604Z-spartan-cfg-7ed4f9986484`](bench-results/poseidon2-spartan/20260910T140604Z-spartan-cfg-7ed4f9986484/) | normal | 10 (30) | 2^24 × 2^24 | `5a9be0e1dfa1` | `cfg-7ed4f9986484` |
-| [`20260910T143206Z-spartan-cfg-0e29b40d66ad`](bench-results/poseidon2-spartan/20260910T143206Z-spartan-cfg-0e29b40d66ad/) | proof_size | 10 (30) | 2^24 × 2^24 | `5a9be0e1dfa1` | `cfg-0e29b40d66ad` |
-
-Raw Criterion data, immutable run configs, manifests, and the proof-size sidecar live in each run directory. Reproduce with `scripts/run_poseidon_spartan_bench.sh` (see plan/poseidon_spartan_bench.md §6, §10).
-<!-- poseidon2-spartan-bench:end -->
-
-### Limber vs emulated-field baseline: the headline comparison
-
-Canonical `H = 10` runs (30 Poseidon2 compressions across BN254-Fr,
-BLS12-381-Fr, secp256k1-Fr), single-threaded, `-C target-cpu=native`,
-Apple M4 Pro, commit `5a9be0e`, Hyrax-vs-Hyrax. Medians with Criterion 95%
-intervals; ModP runs `20260910T143911Z-cfg-550923735ba7` /
-`…144208Z-cfg-6bde446e6974`, spartan runs
-`20260910T140604Z-spartan-cfg-7ed4f9986484` / `…143206Z-spartan-cfg-0e29b40d66ad`.
-
-| Metric | Limber ModP (Hyrax) | Emulated classic Spartan | Ratio |
-| --- | ---: | ---: | ---: |
-| Real constraints (padded) | 12,990 (2^14) | 9,454,119 (2^24) | **728×** |
-| `prove_e2e` median | 1.31 s [1.17, 1.57] | 38.54 s [34.07, 42.12] | **29×** |
-| `verify` median | 92.3 ms [78.5, 113.1] | 4.51 s [4.25, 5.50] | **49×** |
-| `setup` median (not headlined; domains differ) | 212.7 ms | 50.2 s | 236× |
-| Proof comparison payload | 138,901 B | 340,508 B | **2.5×** |
-
-Proof-size caveat (disclosed, not hidden): the spartan payload is exact
-canonical bincode (340,900 B wire including the 392 B public values),
-while ModP's sumcheck remainder (1,248 B of its 138,901 B payload —
-commitments 8,472 B + eval argument 129,181 B) is an analytical figure
-without framing, so the 2.5× is not an exact wire-format ratio. Row and
-time ratios are quoted separately by design — never a single blended “×”.
-

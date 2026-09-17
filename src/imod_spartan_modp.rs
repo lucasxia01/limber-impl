@@ -39,7 +39,10 @@
 
 use crate::{
   errors::SpartanError,
-  imod_r1cs_modp::{IntModR1CSInstanceModp, IntModR1CSShapeModp, IntModR1CSWitnessModp},
+  imod_r1cs_modp::{
+    CompactEntry, CompactMatrices, IntModR1CSInstanceModp, IntModR1CSShapeModp,
+    IntModR1CSWitnessModp,
+  },
   math::Math,
   polys_modp::{eq::EqPolynomial, multilinear::MultilinearPolynomial},
   prime_sampler::{
@@ -135,16 +138,6 @@ fn segment_relative_blocks(
 fn biguint_vec_to_scalars<M: ModEngine>(v: &[BigUint], params: &MParams<M>) -> Vec<MScalar<M>> {
   v.par_iter()
     .map(|b| biguint_to_scalar::<M>(b, params))
-    .collect()
-}
-
-fn biguint_matrix_to_scalars<M: ModEngine>(
-  entries: &[(usize, usize, BigUint)],
-  params: &MParams<M>,
-) -> Vec<(usize, usize, MScalar<M>)> {
-  entries
-    .par_iter()
-    .map(|(i, j, v)| (*i, *j, biguint_to_scalar::<M>(v, params)))
     .collect()
 }
 
@@ -666,15 +659,18 @@ where
     let zero = MScalar::<M>::zero(&params);
     let one = MScalar::<M>::one(&params);
 
-    // 4. Reduce shape/witness/IO from BigUint to M::Scalar mod p.
+    // 4. Reduce shape/witness/IO from BigUint to M::Scalar mod p. The
+    // matrices and moduli go through the shape's coefficient table, so
+    // only the distinct coefficient values are reduced.
     let (_red_span, red_t) = start_span!("imod_modp_reduce");
-    let mods_p = biguint_vec_to_scalars::<M>(&shape.mods, &params);
+    let table_p = biguint_vec_to_scalars::<M>(&shape.compact.table, &params);
+    let mods_p = compact_mods_to_scalars::<M>(&shape.compact, &table_p);
     let w_p = biguint_vec_to_scalars::<M>(&W.w, &params);
     let q_p = biguint_vec_to_scalars::<M>(&W.q, &params);
     let x_p = biguint_vec_to_scalars::<M>(&U.x, &params);
-    let a_p = biguint_matrix_to_scalars::<M>(&shape.A, &params);
-    let b_p = biguint_matrix_to_scalars::<M>(&shape.B, &params);
-    let c_p = biguint_matrix_to_scalars::<M>(&shape.C, &params);
+    let a_p = compact_matrix_to_scalars::<M>(&shape.compact.a, &table_p);
+    let b_p = compact_matrix_to_scalars::<M>(&shape.compact.b, &table_p);
+    let c_p = compact_matrix_to_scalars::<M>(&shape.compact.c, &table_p);
     info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_modp_reduce");
 
     // z = (W, 1, X), padded to 2*num_vars for the MLE.
@@ -930,13 +926,13 @@ where
     let zero = MScalar::<M>::zero(&params);
     let one = MScalar::<M>::one(&params);
 
-    // 4. Reduce shape/IO from BigUint to M::Scalar mod p.
+    // 4. Reduce shape/IO from BigUint to M::Scalar mod p. Only the
+    // shape's distinct coefficient values are reduced; the matrices are
+    // consumed through their compact (index) form below.
     let (_red_span, red_t) = start_span!("imod_modp_reduce");
-    let mods_p = biguint_vec_to_scalars::<M>(&shape.mods, &params);
+    let table_p = biguint_vec_to_scalars::<M>(&shape.compact.table, &params);
+    let mods_p = compact_mods_to_scalars::<M>(&shape.compact, &table_p);
     let x_p = biguint_vec_to_scalars::<M>(&U.x, &params);
-    let a_p = biguint_matrix_to_scalars::<M>(&shape.A, &params);
-    let b_p = biguint_matrix_to_scalars::<M>(&shape.B, &params);
-    let c_p = biguint_matrix_to_scalars::<M>(&shape.C, &params);
     info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_modp_reduce");
 
     // Outer SC verification.
@@ -988,7 +984,8 @@ where
 
     let t_x = EqPolynomial::<MScalar<M>>::evals_from_points(&r_x, &params);
     let t_y = EqPolynomial::<MScalar<M>>::evals_from_points(&r_y, &params);
-    let (eval_a, eval_b, eval_c) = evaluate_matrices::<M>(&a_p, &b_p, &c_p, &t_x, &t_y, &params);
+    let (eval_a, eval_b, eval_c) =
+      evaluate_matrices::<M>(&shape.compact, &table_p, &t_x, &t_y, &params);
 
     let inner_final_expected = (eval_a + r * eval_b + r * r * eval_c) * eval_z;
     if claim_inner_final != inner_final_expected {
@@ -1156,24 +1153,53 @@ fn dense_evaluate<M: ModEngine>(
 }
 
 /// Evaluate A, B, C MLEs at (r_x, r_y) via precomputed eq-tables.
+/// Materialize a compact matrix as `(row, col, coeff mod p)` triples from
+/// the already-reduced coefficient table (a lookup per entry, no
+/// reduction).
+fn compact_matrix_to_scalars<M: ModEngine>(
+  entries: &[CompactEntry],
+  table_p: &[MScalar<M>],
+) -> Vec<(usize, usize, MScalar<M>)> {
+  entries
+    .iter()
+    .map(|e| (e.row as usize, e.col as usize, table_p[e.coeff as usize]))
+    .collect()
+}
+
+/// The per-row moduli mod `p`, looked up from the reduced coefficient table.
+fn compact_mods_to_scalars<M: ModEngine>(
+  cm: &CompactMatrices,
+  table_p: &[MScalar<M>],
+) -> Vec<MScalar<M>> {
+  cm.mods.iter().map(|i| table_p[*i as usize]).collect()
+}
+
+/// `A(t_x, t_y)`, `B(t_x, t_y)`, `C(t_x, t_y)` from the compact matrices:
+/// one product `t_x[i] · t_y[j]` per nonzero, times the coefficient only
+/// when it is not `1`.
 fn evaluate_matrices<M: ModEngine>(
-  a: &[(usize, usize, MScalar<M>)],
-  b: &[(usize, usize, MScalar<M>)],
-  c: &[(usize, usize, MScalar<M>)],
+  cm: &CompactMatrices,
+  table_p: &[MScalar<M>],
   t_x: &[MScalar<M>],
   t_y: &[MScalar<M>],
   params: &MParams<M>,
 ) -> (MScalar<M>, MScalar<M>, MScalar<M>) {
   let zero = MScalar::<M>::zero(params);
-  let eval_one = |entries: &[(usize, usize, MScalar<M>)]| -> MScalar<M> {
-    entries
-      .iter()
-      .map(|(i, j, v)| t_x[*i] * t_y[*j] * *v)
-      .fold(zero, |a, b| a + b)
+  let eval_one = |entries: &[CompactEntry]| -> MScalar<M> {
+    let mut acc = zero;
+    for e in entries {
+      let prod = t_x[e.row as usize] * t_y[e.col as usize];
+      if e.coeff == CompactMatrices::UNIT {
+        acc += prod;
+      } else {
+        acc += prod * table_p[e.coeff as usize];
+      }
+    }
+    acc
   };
   let (eval_a, (eval_b, eval_c)) = rayon::join(
-    || eval_one(a),
-    || rayon::join(|| eval_one(b), || eval_one(c)),
+    || eval_one(&cm.a),
+    || rayon::join(|| eval_one(&cm.b), || eval_one(&cm.c)),
   );
   (eval_a, eval_b, eval_c)
 }
