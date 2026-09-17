@@ -121,13 +121,21 @@ fn main() {
     w[1 + gates + i] = c.clone();
     chain_a = c;
   }
-  println!("witness gen:    {:9.1} ms", t.elapsed().as_secs_f64() * 1e3);
+  let witness_gen = t.elapsed();
+  println!("witness gen:    {:9.1} ms", witness_gen.as_secs_f64() * 1e3);
 
   let t = Instant::now();
   let (witness, instance) =
     IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).expect("witness commit");
   let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).expect("prove");
-  println!("commit+prove:   {:9.1} ms", t.elapsed().as_secs_f64() * 1e3);
+  let commit_prove = t.elapsed();
+  println!("commit+prove:   {:9.1} ms", commit_prove.as_secs_f64() * 1e3);
+  // Prover time as reported everywhere else in this repo and the paper:
+  // witness generation plus commitment plus proving.
+  println!(
+    "prove (total):  {:9.1} ms",
+    (witness_gen + commit_prove).as_secs_f64() * 1e3
+  );
 
   let t = Instant::now();
   proof.verify(&vk, &instance).expect("verify");
