@@ -8,8 +8,8 @@
     yticklabel style={font=\scriptsize, text width=2.4em, align=right},
     xticklabel style={font=\scriptsize},
     ymode=log,
-    ytick={20,50,100,200,500,1000}, log ticks with fixed point,
-    xtick={10,12,14}, xticklabels={$2^{10}$,$2^{12}$,$2^{14}$},
+    ytick={20,50,100,200,500,1000,2000,5000,10000}, log ticks with fixed point,
+    xtick={10,12,14,16,18}, xticklabels={$2^{10}$,$2^{12}$,$2^{14}$,$2^{16}$,$2^{18}$},
     xlabel={Constraints}, ylabel={Prover time (ms)},
     grid=both, grid style={gray!20},
     % legend above the axes so it never occludes either series
@@ -19,13 +19,15 @@
     error bars/y dir=both, error bars/y explicit,
   ]
     \addplot[ourscolor, thick, mark=*, mark size=1.8pt]
-      coordinates {(10,120.868) +- (2.720,1.003) (12,270.020) +- (3.310,2.384) (14,790.387) +- (7.769,18.317)};
+      coordinates {(10,111.323) +- (2.470,1.653) (12,225.279) +- (0.927,3.132) (14,676.837) +- (3.080,7.803) (16,2531.511) +- (6.651,28.514) (18,10255.402) +- (110.419,73.878)};
     \addlegendentry{IntMod-Spartan}
     \addplot[basecolor, thick, mark=square*, mark size=1.8pt]
-      coordinates {(10,19.390) +- (0.101,0.144) (12,45.978) +- (0.213,0.270) (14,97.676) +- (0.284,0.949)};
+      coordinates {(10,18.716) +- (0.099,0.234) (12,45.545) +- (0.287,0.233) (14,95.049) +- (0.521,0.259) (16,294.705) +- (1.658,1.545) (18,1090.200) +- (2.956,2.396)};
     \addlegendentry{Spartan (native baseline)}
-    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:10,120.868) {6.2$\times$};
-    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:12,270.020) {5.9$\times$};
-    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:14,790.387) {8.1$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:10,111.323) {5.9$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:12,225.279) {4.9$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:14,676.837) {7.1$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:16,2531.511) {8.6$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:18,10255.402) {9.4$\times$};
   \end{axis}
 \end{tikzpicture}

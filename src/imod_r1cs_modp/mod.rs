@@ -25,6 +25,7 @@ use num_bigint::BigUint;
 use num_traits::Zero;
 use rand_core::{CryptoRng, CryptoRngCore, RngCore};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use tracing::info;
 
 /// An aligned witness segment committed at its own value-width bound
@@ -55,6 +56,102 @@ type ModVK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::VerifierKey;
 type ModComm<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::Commitment;
 type ModBlind<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::Blind;
 
+/// One matrix entry of the coefficient-deduplicated view of a shape:
+/// `(row, col)` plus an index into [`CompactMatrices::table`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CompactEntry {
+  pub(crate) row: u32,
+  pub(crate) col: u32,
+  pub(crate) coeff: u32,
+}
+
+/// Coefficient-deduplicated view of `(A, B, C, mods)`, derived from the
+/// integer matrices when the shape is built. Real circuits use only a
+/// handful of distinct coefficient values (1, powers of two, the moduli),
+/// so reducing `table` modulo the verifier-sampled prime `p` — instead of
+/// every nonzero — makes the per-proof reduction `O(#distinct)` rather
+/// than `O(nnz)`, and lets the verifier's matrix evaluation skip the
+/// multiplication for unit coefficients. `table[UNIT] == 1` always.
+///
+/// This is purely a cache of `A`, `B`, `C`, `mods`: it carries no extra
+/// information and does not enter the shape digest.
+#[derive(Clone, Debug)]
+pub(crate) struct CompactMatrices {
+  pub(crate) table: Vec<BigUint>,
+  pub(crate) a: Vec<CompactEntry>,
+  pub(crate) b: Vec<CompactEntry>,
+  pub(crate) c: Vec<CompactEntry>,
+  /// `mods[r]` as an index into `table`.
+  pub(crate) mods: Vec<u32>,
+}
+
+impl CompactMatrices {
+  /// Index of the coefficient `1` in `table`.
+  pub(crate) const UNIT: u32 = 0;
+
+  fn build(
+    a: &[(usize, usize, BigUint)],
+    b: &[(usize, usize, BigUint)],
+    c: &[(usize, usize, BigUint)],
+    mods: &[BigUint],
+  ) -> Result<Self, SpartanError> {
+    struct Interner {
+      table: Vec<BigUint>,
+      index: HashMap<BigUint, u32>,
+    }
+    impl Interner {
+      fn intern(&mut self, v: &BigUint) -> Result<u32, SpartanError> {
+        if let Some(i) = self.index.get(v) {
+          return Ok(*i);
+        }
+        let i = u32::try_from(self.table.len()).map_err(|_| SpartanError::InvalidInputLength {
+          reason: "too many distinct matrix coefficients for the compact view".to_string(),
+        })?;
+        self.table.push(v.clone());
+        self.index.insert(v.clone(), i);
+        Ok(i)
+      }
+    }
+    let one = BigUint::from(1u8);
+    let mut it = Interner {
+      table: vec![one.clone()],
+      index: HashMap::from([(one, Self::UNIT)]),
+    };
+    let idx = |v: usize| {
+      u32::try_from(v).map_err(|_| SpartanError::InvalidInputLength {
+        reason: "matrix index exceeds u32 in the compact view".to_string(),
+      })
+    };
+    let mut conv =
+      |entries: &[(usize, usize, BigUint)]| -> Result<Vec<CompactEntry>, SpartanError> {
+        entries
+          .iter()
+          .map(|(r, c, v)| {
+            Ok(CompactEntry {
+              row: idx(*r)?,
+              col: idx(*c)?,
+              coeff: it.intern(v)?,
+            })
+          })
+          .collect()
+      };
+    let a = conv(a)?;
+    let b = conv(b)?;
+    let c = conv(c)?;
+    let mods = mods
+      .iter()
+      .map(|m| it.intern(m))
+      .collect::<Result<Vec<u32>, SpartanError>>()?;
+    Ok(Self {
+      table: it.table,
+      a,
+      b,
+      c,
+      mods,
+    })
+  }
+}
+
 /// IntMod-R1CS shape over `M: ModEngine`. Integer-valued
 /// matrices/mods; `p`-independent so the same shape can be used with any
 /// verifier-sampled prime.
@@ -77,6 +174,8 @@ pub struct IntModR1CSShapeModp<M: ModEngine> {
   pub(crate) B: Vec<(usize, usize, BigUint)>,
   pub(crate) C: Vec<(usize, usize, BigUint)>,
   pub(crate) mods: Vec<BigUint>,
+  /// Coefficient-deduplicated view of `A`, `B`, `C`, `mods` (a cache).
+  pub(crate) compact: CompactMatrices,
   /// Aligned witness blocks asserted `< 2^16` by the Mod-PCS (no rows).
   pub(crate) small_blocks: Vec<SmallValueBlock>,
   /// Width-grouped commitment segments tiling `[0, num_vars)`; empty means
@@ -146,6 +245,7 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
         }
       }
     }
+    let compact = CompactMatrices::build(&A, &B, &C, &mods)?;
     Ok(Self {
       num_cons,
       num_vars,
@@ -154,6 +254,7 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
       B,
       C,
       mods,
+      compact,
       small_blocks: Vec::new(),
       width_segments: Vec::new(),
       _phantom: core::marker::PhantomData,

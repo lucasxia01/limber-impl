@@ -28,7 +28,7 @@ CRITERION = os.path.join(ROOT, "target", "criterion")
 OUTDIR = os.path.join(ROOT, "docs", "plots")
 
 # log2(num_cons) of the sweep points; vars = 2^(lc+1).
-SIZES = [10, 12, 14]
+SIZES = [10, 12, 14, 16, 18]
 
 SERIES = {
     "IntMod-Spartan": "imod_spartan_modp",
