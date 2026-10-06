@@ -120,6 +120,127 @@ fn idx_mle_eval<F: PrimeField>(point: &[F]) -> F {
   acc
 }
 
+/// A public lookup table for the LogUp-GKR membership argument.
+///
+/// The table is indexed by `[0, 2^domain_bits())`: `entry(j)` is the
+/// value at index `j`, `index_of(w)` inverts it (returning `None` for
+/// non-members — the prover-side membership check), and `entry_mle`
+/// evaluates the multilinear extension of `j ↦ entry(j)` in closed form
+/// (`point[0]` is the most significant index variable, matching the
+/// GKR's variable order). `Range { bits }` is the identity table
+/// `entry(j) = j`, which makes membership a range check — the original
+/// use of this module; the `bits`-based proof APIs are thin wrappers
+/// over it.
+///
+/// Soundness note: table entries must stay far below the field
+/// characteristic so that field equality of looked-up values lifts to
+/// integer equality — the same bounded-values argument the range check
+/// relies on. Every variant here keeps entries below `2^24`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LookupTable {
+  /// The identity table over `[0, 2^bits)`: membership = range check.
+  Range {
+    /// log2 of the table size.
+    bits: usize,
+  },
+  /// 8-bit XOR, packed: index `j = a·2^8 + b`, entry
+  /// `t(j) = a·2^16 + b·2^8 + (a XOR b)`. Constraining a witness value
+  /// to this table proves the packed triple satisfies `c = a XOR b`
+  /// with `a, b, c < 2^8`; the caller recombines `a`, `b`, `c` from the
+  /// packed value with linear constraints, which are free in Mod-R1CS.
+  Xor8,
+  /// 8-bit AND, packed like [`LookupTable::Xor8`]:
+  /// `t(j) = a·2^16 + b·2^8 + (a AND b)`.
+  And8,
+}
+
+impl LookupTable {
+  /// log2 of the table's index domain.
+  pub fn domain_bits(&self) -> usize {
+    match self {
+      LookupTable::Range { bits } => *bits,
+      LookupTable::Xor8 | LookupTable::And8 => 16,
+    }
+  }
+
+  /// The table value at index `j` (callers keep `j < 2^domain_bits()`).
+  pub fn entry(&self, j: u64) -> u64 {
+    match self {
+      LookupTable::Range { .. } => j,
+      LookupTable::Xor8 => {
+        let (a, b) = ((j >> 8) & 0xff, j & 0xff);
+        (a << 16) | (b << 8) | (a ^ b)
+      }
+      LookupTable::And8 => {
+        let (a, b) = ((j >> 8) & 0xff, j & 0xff);
+        (a << 16) | (b << 8) | (a & b)
+      }
+    }
+  }
+
+  /// The index whose entry is `w`, or `None` if `w` is not in the table.
+  pub fn index_of(&self, w: u64) -> Option<u64> {
+    match self {
+      LookupTable::Range { bits } => (*bits >= 64 || w < (1u64 << bits)).then_some(w),
+      LookupTable::Xor8 | LookupTable::And8 => {
+        if w >= (1u64 << 24) {
+          return None;
+        }
+        let (a, b, c) = (w >> 16, (w >> 8) & 0xff, w & 0xff);
+        let expect = match self {
+          LookupTable::Xor8 => a ^ b,
+          _ => a & b,
+        };
+        (c == expect).then_some((a << 8) | b)
+      }
+    }
+  }
+
+  /// Closed-form evaluation of the MLE of `j ↦ entry(j)` at `point`
+  /// (`point.len() == domain_bits()`, `point[0]` the most significant
+  /// index variable). For the packed bitwise tables the per-bit op is
+  /// multilinear in the index bits (`a_k ⊕ b_k = a_k + b_k − 2·a_k·b_k`,
+  /// `a_k ∧ b_k = a_k·b_k`), so the whole entry function is.
+  pub fn entry_mle<F: PrimeField>(&self, point: &[F]) -> F {
+    match self {
+      LookupTable::Range { .. } => idx_mle_eval(point),
+      LookupTable::Xor8 | LookupTable::And8 => {
+        debug_assert_eq!(point.len(), 16);
+        let (a_bits, b_bits) = point.split_at(8);
+        let mut acc = F::ZERO;
+        let mut pow = F::ONE; // 2^(7-k) as k descends
+        for k in (0..8).rev() {
+          let (ak, bk) = (a_bits[k], b_bits[k]);
+          let op = match self {
+            LookupTable::Xor8 => ak + bk - ak * bk - ak * bk,
+            _ => ak * bk,
+          };
+          // a-bit weight 2^(16+7-k), b-bit weight 2^(8+7-k), op 2^(7-k).
+          let pow8 = pow * F::from(1u64 << 8);
+          let pow16 = pow8 * F::from(1u64 << 8);
+          acc += ak * pow16 + bk * pow8 + op * pow;
+          pow = pow + pow;
+        }
+        acc
+      }
+    }
+  }
+
+  /// Whether the leaf-skip fast paths may be used: the witness-side
+  /// `OnesAffine` hint needs raw values below `2^24`, and the
+  /// table-side `TableAffine` hint additionally assumes the identity
+  /// table (`entry(j) = j`).
+  fn witness_hint_ok(&self) -> bool {
+    match self {
+      LookupTable::Range { bits } => *bits <= 24,
+      LookupTable::Xor8 | LookupTable::And8 => true, // entries < 2^24
+    }
+  }
+  fn table_hint_ok(&self) -> bool {
+    matches!(self, LookupTable::Range { bits } if *bits <= 24)
+  }
+}
+
 /// One GKR layer's reduction: the cubic-sumcheck round polynomials (each as
 /// evaluations at `0,1,2,3`) plus the input layer's four evaluations
 /// `(p(0,ρ'), p(1,ρ'), q(0,ρ'), q(1,ρ'))` at the sumcheck point.
@@ -1606,19 +1727,30 @@ impl<
   /// the LogUp challenge `r`) gets the exact vector `prove` will use.
   /// Errors if any witness value is out of range.
   pub fn multiplicities(bits: usize, witness: &[u64]) -> Result<Vec<u64>, SpartanError> {
-    let table = 1usize << bits;
+    Self::lookup_multiplicities(&LookupTable::Range { bits }, witness)
+  }
+
+  /// [`Self::multiplicities`] for a general [`LookupTable`]: multiplicities
+  /// are indexed by table *index*, and each witness value must be a table
+  /// member (`index_of` succeeds). Padding uses the value `0`, which every
+  /// supported table contains.
+  pub fn lookup_multiplicities(
+    table: &LookupTable,
+    witness: &[u64],
+  ) -> Result<Vec<u64>, SpartanError> {
+    let size = 1usize << table.domain_bits();
     let n = witness.len().max(1).next_power_of_two();
-    let mut mult = vec![0u64; table];
+    let mut mult = vec![0u64; size];
     for &w in witness {
-      let idx = w as usize;
-      if idx >= table {
-        return Err(SpartanError::InvalidInputLength {
-          reason: format!("logup-gkr: witness value {w} >= 2^{bits}"),
-        });
-      }
+      let idx = table.index_of(w).ok_or_else(|| SpartanError::InvalidInputLength {
+        reason: format!("logup-gkr: witness value {w} is not in table {table:?}"),
+      })? as usize;
       mult[idx] += 1;
     }
-    mult[0] += (n - witness.len()) as u64;
+    let idx0 = table.index_of(0).ok_or_else(|| SpartanError::InvalidInputLength {
+      reason: format!("logup-gkr: table {table:?} lacks the padding value 0"),
+    })? as usize;
+    mult[idx0] += (n - witness.len()) as u64;
     Ok(mult)
   }
 
@@ -1634,19 +1766,29 @@ impl<
     witness: &[u64],
     transcript: &mut E::TE,
   ) -> Result<(Self, RangeClaims<E>), SpartanError> {
+    Self::lookup_prove(&LookupTable::Range { bits }, witness, transcript)
+  }
+
+  /// [`Self::prove`] for a general [`LookupTable`]: proves every value in
+  /// `witness` is a member of `table`.
+  pub fn lookup_prove(
+    table: &LookupTable,
+    witness: &[u64],
+    transcript: &mut E::TE,
+  ) -> Result<(Self, RangeClaims<E>), SpartanError> {
     if witness.is_empty() {
       return Err(SpartanError::InvalidInputLength {
         reason: "logup-gkr: empty witness".to_string(),
       });
     }
-    let table = 1usize << bits;
+    let size = 1usize << table.domain_bits();
     let n = witness.len().next_power_of_two();
 
     // Multiplicities over the table, plus the padding `0`s. Callers that
     // commit the multiplicity polynomial (they must, before this point in
     // the transcript) obtain the identical vector from
-    // [`Self::multiplicities`].
-    let mult = Self::multiplicities(bits, witness)?;
+    // [`Self::lookup_multiplicities`].
+    let mult = Self::lookup_multiplicities(table, witness)?;
 
     transcript.dom_sep(b"logup_range");
     let r = transcript.squeeze(b"logup_r")?;
@@ -1659,12 +1801,12 @@ impl<
       *slot = r + E::Scalar::from(w);
     }
 
-    // Table-side leaves: (m_j, r + j).
-    let mut p_rhs = vec![E::Scalar::ZERO; table];
-    let mut q_rhs = vec![E::Scalar::ZERO; table];
-    for j in 0..table {
+    // Table-side leaves: (m_j, r + entry(j)).
+    let mut p_rhs = vec![E::Scalar::ZERO; size];
+    let mut q_rhs = vec![E::Scalar::ZERO; size];
+    for j in 0..size {
       p_rhs[j] = E::Scalar::from(mult[j]);
-      q_rhs[j] = r + E::Scalar::from(j as u64);
+      q_rhs[j] = r + E::Scalar::from(table.entry(j as u64));
     }
 
     let lhs = gkr_prove::<E>(p_lhs, q_lhs, true, transcript)?;
@@ -1699,6 +1841,15 @@ impl<
     bits: usize,
     transcript: &mut E::TE,
   ) -> Result<RangeClaims<E>, SpartanError> {
+    self.lookup_verify(&LookupTable::Range { bits }, transcript)
+  }
+
+  /// [`Self::verify`] for a general [`LookupTable`].
+  pub fn lookup_verify(
+    &self,
+    table: &LookupTable,
+    transcript: &mut E::TE,
+  ) -> Result<RangeClaims<E>, SpartanError> {
     let d_lhs = self.lhs_gkr.layers.len();
 
     transcript.dom_sep(b"logup_range");
@@ -1714,7 +1865,7 @@ impl<
     let (rhs_point, rhs_p, rhs_q) = gkr_verify::<E>(
       self.p_rhs_root,
       self.q_rhs_root,
-      bits,
+      table.domain_bits(),
       &self.rhs_gkr,
       transcript,
     )?;
@@ -1738,11 +1889,11 @@ impl<
         reason: "logup-gkr: witness numerator leaf != 1".to_string(),
       });
     }
-    // Table denominators are r + idx(j); the verifier reconstructs idx in
-    // closed form.
-    if rhs_q != r + idx_mle_eval::<E::Scalar>(&rhs_point) {
+    // Table denominators are r + entry(j); the verifier reconstructs the
+    // entry MLE in closed form.
+    if rhs_q != r + table.entry_mle::<E::Scalar>(&rhs_point) {
       return Err(SpartanError::ProofVerifyError {
-        reason: "logup-gkr: table index leaf mismatch".to_string(),
+        reason: "logup-gkr: table entry leaf mismatch".to_string(),
       });
     }
 
@@ -1811,8 +1962,18 @@ impl<
   /// must commit this table and absorb it *before* the transcript point
   /// where [`Self::prove`] squeezes the LogUp challenge `r`.
   pub fn multiplicities(bits: usize, witnesses: &[&[u64]]) -> Result<Vec<u64>, SpartanError> {
-    let table = 1usize << bits;
-    let mut mult = vec![0u64; table];
+    Self::lookup_multiplicities(&LookupTable::Range { bits }, witnesses)
+  }
+
+  /// [`Self::multiplicities`] for a general [`LookupTable`]: multiplicities
+  /// are indexed by table *index*, and every value of every witness must be
+  /// a table member.
+  pub fn lookup_multiplicities(
+    table: &LookupTable,
+    witnesses: &[&[u64]],
+  ) -> Result<Vec<u64>, SpartanError> {
+    let size = 1usize << table.domain_bits();
+    let mut mult = vec![0u64; size];
     for (b, witness) in witnesses.iter().enumerate() {
       if witness.is_empty() || !witness.len().is_power_of_two() {
         return Err(SpartanError::InvalidInputLength {
@@ -1823,12 +1984,9 @@ impl<
         });
       }
       for &w in witness.iter() {
-        let idx = w as usize;
-        if idx >= table {
-          return Err(SpartanError::InvalidInputLength {
-            reason: format!("logup-gkr multi: witness {b} value {w} >= 2^{bits}"),
-          });
-        }
+        let idx = table.index_of(w).ok_or_else(|| SpartanError::InvalidInputLength {
+          reason: format!("logup-gkr multi: witness {b} value {w} is not in table {table:?}"),
+        })? as usize;
         mult[idx] += 1;
       }
     }
@@ -1841,31 +1999,51 @@ impl<
     witnesses: &[&[u64]],
     transcript: &mut E::TE,
   ) -> Result<(Self, MultiRangeClaims<E>), SpartanError> {
+    Self::lookup_prove(&LookupTable::Range { bits }, witnesses, transcript)
+  }
+
+  /// [`Self::prove`] for a general [`LookupTable`]: proves every value of
+  /// every witness is a member of `table`.
+  pub fn lookup_prove(
+    table: &LookupTable,
+    witnesses: &[&[u64]],
+    transcript: &mut E::TE,
+  ) -> Result<(Self, MultiRangeClaims<E>), SpartanError> {
     if witnesses.is_empty() {
       return Err(SpartanError::InvalidInputLength {
         reason: "logup-gkr multi: no witnesses".to_string(),
       });
     }
-    let table = 1usize << bits;
-    let mult = Self::multiplicities(bits, witnesses)?;
+    let size = 1usize << table.domain_bits();
+    let is_range = matches!(table, LookupTable::Range { .. });
+    let mult = Self::lookup_multiplicities(table, witnesses)?;
 
     transcript.dom_sep(b"logup_multi_range");
     let r = transcript.squeeze(b"logup_r")?;
 
-    // Shared denominator table `r + j` for j < 2^bits, built with 2^bits
-    // field ADDS (each `Scalar::from` is a Montgomery multiplication;
-    // the witness trees would otherwise pay one per leaf — millions per
-    // proof).
-    let mut r_plus: Vec<E::Scalar> = Vec::with_capacity(table);
-    let mut acc = r;
-    for _ in 0..table {
-      r_plus.push(acc);
-      acc += E::Scalar::ONE;
+    // Shared denominator table `r + entry(j)` for j < 2^domain_bits. For
+    // the identity (range) table this is built with 2^bits field ADDS
+    // (each `Scalar::from` is a Montgomery multiplication; the witness
+    // trees would otherwise pay one per leaf — millions per proof), and
+    // doubles as the witness-leaf lookup `r_plus[w]`. For general tables
+    // the witness values are entries, not indices, so witness leaves are
+    // built directly as `r + from(w)`.
+    let mut r_plus: Vec<E::Scalar> = Vec::with_capacity(size);
+    if is_range {
+      let mut acc = r;
+      for _ in 0..size {
+        r_plus.push(acc);
+        acc += E::Scalar::ONE;
+      }
+    } else {
+      for j in 0..size {
+        r_plus.push(r + E::Scalar::from(table.entry(j as u64)));
+      }
     }
 
     // One fraction tree per witness — leaves (1, r + w_b[i]), the
     // all-ones numerator table elided — plus the shared table tree with
-    // leaves (m_j, r + j), all proven IN LOCKSTEP with shared
+    // leaves (m_j, r + entry(j)), all proven IN LOCKSTEP with shared
     // challenges (see `gkr_prove_multi`; this is what lets the
     // per-round work parallelize across trees instead of running one
     // serial GKR per witness).
@@ -1876,14 +2054,19 @@ impl<
       } else {
         vec![E::Scalar::ONE]
       };
-      let q: Vec<E::Scalar> = witness.iter().map(|&w| r_plus[w as usize]).collect();
+      let q: Vec<E::Scalar> = if is_range {
+        witness.iter().map(|&w| r_plus[w as usize]).collect()
+      } else {
+        witness.iter().map(|&w| r + E::Scalar::from(w)).collect()
+      };
       inputs.push(GkrTreeInput {
         p,
         q,
         ones: true,
         // Structured-leaf hint for the leaf-skip fast path (its u64
-        // basis accumulators need witness values < 2^24).
-        raw: if bits <= 24 {
+        // basis accumulators need witness values < 2^24; every
+        // non-range table keeps its entries below 2^24).
+        raw: if table.witness_hint_ok() {
           LeafHint::OnesAffine {
             offset: r,
             raw: witness,
@@ -1899,7 +2082,8 @@ impl<
       p: p_rhs,
       q: q_rhs,
       ones: false,
-      raw: if bits <= 24 {
+      // The table-side fast path assumes the identity table (`q = r + j`).
+      raw: if table.table_hint_ok() {
         LeafHint::TableAffine {
           offset: r,
           mult: &mult,
@@ -1946,6 +2130,16 @@ impl<
     expected_wit_depths: &[usize],
     transcript: &mut E::TE,
   ) -> Result<MultiRangeClaims<E>, SpartanError> {
+    self.lookup_verify(&LookupTable::Range { bits }, expected_wit_depths, transcript)
+  }
+
+  /// [`Self::verify`] for a general [`LookupTable`].
+  pub fn lookup_verify(
+    &self,
+    table: &LookupTable,
+    expected_wit_depths: &[usize],
+    transcript: &mut E::TE,
+  ) -> Result<MultiRangeClaims<E>, SpartanError> {
     if self.wit_roots.len() != expected_wit_depths.len() || expected_wit_depths.is_empty() {
       return Err(SpartanError::ProofVerifyError {
         reason: "logup-gkr multi: witness tree count mismatch".to_string(),
@@ -1960,7 +2154,7 @@ impl<
     let mut roots: Vec<(E::Scalar, E::Scalar)> = self.wit_roots.clone();
     roots.push((self.p_rhs_root, self.q_rhs_root));
     let mut depths: Vec<usize> = expected_wit_depths.to_vec();
-    depths.push(bits);
+    depths.push(table.domain_bits());
     let mut leaf_outs = gkr_verify_multi::<E>(&roots, &depths, &self.gkr, transcript)?;
 
     let (rhs_point, rhs_p, rhs_q) = leaf_outs.pop().expect("table tree present");
@@ -1974,10 +2168,10 @@ impl<
       }
       wit_claims.push((point, leaf_q - r));
     }
-    // Table denominators are r + idx(j), checked in closed form.
-    if rhs_q != r + idx_mle_eval::<E::Scalar>(&rhs_point) {
+    // Table denominators are r + entry(j), checked in closed form.
+    if rhs_q != r + table.entry_mle::<E::Scalar>(&rhs_point) {
       return Err(SpartanError::ProofVerifyError {
-        reason: "logup-gkr multi: table index leaf mismatch".to_string(),
+        reason: "logup-gkr multi: table entry leaf mismatch".to_string(),
       });
     }
 
@@ -2097,6 +2291,147 @@ mod tests {
     let mut rng = StdRng::seed_from_u64(42);
     let witness: Vec<u64> = (0..200).map(|_| rng.gen_range(0..256)).collect();
     range_roundtrip_with::<T256HyraxEngine>(8, &witness);
+  }
+
+  /// Pack an 8-bit op triple the way the bitwise tables expect.
+  fn pack(a: u64, b: u64, c: u64) -> u64 {
+    (a << 16) | (b << 8) | c
+  }
+
+  #[test]
+  fn lookup_table_entry_mles_match_dense() {
+    // The closed-form entry MLE must agree with the MLE of the dense
+    // entry table at random points — this is the verifier's leaf check.
+    type F = <T256HyraxEngine as Engine>::Scalar;
+    let mut rng = StdRng::seed_from_u64(7);
+    for table in [
+      LookupTable::Range { bits: 12 },
+      LookupTable::Xor8,
+      LookupTable::And8,
+    ] {
+      let bits = table.domain_bits();
+      let dense: Vec<F> = (0..1u64 << bits).map(|j| F::from(table.entry(j))).collect();
+      for _ in 0..3 {
+        let point: Vec<F> = (0..bits).map(|_| F::random(&mut rng)).collect();
+        assert_eq!(
+          table.entry_mle::<F>(&point),
+          mle_eval(&dense, &point),
+          "entry MLE mismatch for {table:?}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn xor8_single_lookup_roundtrip_with_padding() {
+    // 3 witnesses → padded to 4 with the value 0 (a table member).
+    type E = T256HyraxEngine;
+    let table = LookupTable::Xor8;
+    let witness = vec![
+      pack(0x3c, 0xa5, 0x3c ^ 0xa5),
+      pack(0xff, 0xff, 0x00),
+      pack(0x01, 0x02, 0x03),
+    ];
+    let mut tp = <E as Engine>::TE::new(b"logup_test");
+    let (proof, claims_p) =
+      LogUpRangeProof::<E>::lookup_prove(&table, &witness, &mut tp).unwrap();
+    let mut tv = <E as Engine>::TE::new(b"logup_test");
+    let claims_v = proof.lookup_verify(&table, &mut tv).unwrap();
+    assert_eq!(claims_p.wit_eval, claims_v.wit_eval);
+
+    // The witness claim is the MLE of the padded packed values, and the
+    // multiplicity claim is the MLE of the index-domain multiplicities.
+    let mut w_tbl = vec![<E as Engine>::Scalar::ZERO; 4];
+    for (slot, &w) in w_tbl.iter_mut().zip(witness.iter().chain([&0])) {
+      *slot = <E as Engine>::Scalar::from(w);
+    }
+    let mult = LogUpRangeProof::<E>::lookup_multiplicities(&table, &witness).unwrap();
+    let m_tbl: Vec<_> = mult.iter().map(|&m| <E as Engine>::Scalar::from(m)).collect();
+    assert_eq!(claims_v.wit_eval, mle_eval(&w_tbl, &claims_v.wit_point));
+    assert_eq!(claims_v.mult_eval, mle_eval(&m_tbl, &claims_v.mult_point));
+  }
+
+  #[test]
+  fn bitwise_multi_lookup_roundtrips() {
+    type E = T256HyraxEngine;
+    for table in [LookupTable::Xor8, LookupTable::And8] {
+      let op = |a: u64, b: u64| match table {
+        LookupTable::Xor8 => a ^ b,
+        _ => a & b,
+      };
+      let w0: Vec<u64> = vec![
+        pack(0x3c, 0xa5, op(0x3c, 0xa5)),
+        pack(0, 0, 0),
+        pack(0xff, 0x0f, op(0xff, 0x0f)),
+        pack(7, 7, op(7, 7)),
+      ];
+      let w1: Vec<u64> = (0..8).map(|i| pack(i, 0x5a, op(i, 0x5a))).collect();
+      let witnesses: Vec<&[u64]> = vec![&w0, &w1];
+      let mut tp = <E as Engine>::TE::new(b"logup_test");
+      let (proof, claims_p) =
+        LogUpMultiRangeProof::<E>::lookup_prove(&table, &witnesses, &mut tp).unwrap();
+      let mut tv = <E as Engine>::TE::new(b"logup_test");
+      let claims_v = proof.lookup_verify(&table, &[2, 3], &mut tv).unwrap();
+      assert_eq!(claims_p.wit_claims.len(), 2);
+
+      // Witness claims are the MLEs of the packed values; the shared
+      // multiplicity claim is the MLE of the index-domain counts.
+      for ((point, eval), w) in claims_v.wit_claims.iter().zip([&w0, &w1]) {
+        let w_tbl: Vec<_> = w.iter().map(|&x| <E as Engine>::Scalar::from(x)).collect();
+        assert_eq!(*eval, mle_eval(&w_tbl, point), "{table:?}");
+      }
+      let mult = LogUpMultiRangeProof::<E>::lookup_multiplicities(&table, &witnesses).unwrap();
+      let m_tbl: Vec<_> = mult.iter().map(|&m| <E as Engine>::Scalar::from(m)).collect();
+      assert_eq!(claims_v.mult_eval, mle_eval(&m_tbl, &claims_v.mult_point));
+    }
+  }
+
+  #[test]
+  fn lookup_rejects_non_members_at_prove() {
+    type E = T256HyraxEngine;
+    // c != a XOR b.
+    let bad = pack(0x3c, 0xa5, 0x00);
+    let w: Vec<u64> = vec![bad, 0];
+    let mut tp = <E as Engine>::TE::new(b"logup_test");
+    assert!(
+      LogUpMultiRangeProof::<E>::lookup_prove(&LookupTable::Xor8, &[&w], &mut tp).is_err()
+    );
+    // Out-of-width packed values are not members either.
+    assert!(LookupTable::Xor8.index_of(1u64 << 24).is_none());
+    assert!(LookupTable::And8.index_of(pack(1, 1, 3)).is_none());
+  }
+
+  #[test]
+  fn lookup_tampered_proof_rejected() {
+    type E = T256HyraxEngine;
+    let table = LookupTable::Xor8;
+    let w0: Vec<u64> = (0..4).map(|i| pack(i, 0x11, i ^ 0x11)).collect();
+    let witnesses: Vec<&[u64]> = vec![&w0];
+    let mut tp = <E as Engine>::TE::new(b"logup_test");
+    let (mut proof, _) =
+      LogUpMultiRangeProof::<E>::lookup_prove(&table, &witnesses, &mut tp).unwrap();
+    proof.p_rhs_root += <E as Engine>::Scalar::ONE;
+    let mut tv = <E as Engine>::TE::new(b"logup_test");
+    assert!(proof.lookup_verify(&table, &[2], &mut tv).is_err());
+  }
+
+  #[test]
+  fn lookup_table_binding_is_enforced() {
+    // A proof made against the identity (range) table must NOT verify
+    // against the XOR table, even though the values fit both domains:
+    // the verifier's closed-form entry check pins the table.
+    type E = T256HyraxEngine;
+    let w0: Vec<u64> = (0..4).map(|i| pack(i, 0x11, i ^ 0x11)).collect();
+    let witnesses: Vec<&[u64]> = vec![&w0];
+    let mut tp = <E as Engine>::TE::new(b"logup_test");
+    let (proof, _) = LogUpMultiRangeProof::<E>::lookup_prove(
+      &LookupTable::Range { bits: 24 },
+      &witnesses,
+      &mut tp,
+    )
+    .unwrap();
+    let mut tv = <E as Engine>::TE::new(b"logup_test");
+    assert!(proof.lookup_verify(&LookupTable::Xor8, &[2], &mut tv).is_err());
   }
 
   #[test]
