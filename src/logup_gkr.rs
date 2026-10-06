@@ -178,6 +178,20 @@ impl LookupTable {
     }
   }
 
+  /// Stable byte encoding for transcript absorption and shape digests:
+  /// a discriminant byte, plus the size parameter for `Range`.
+  pub fn transcript_bytes(&self) -> Vec<u8> {
+    match self {
+      LookupTable::Range { bits } => {
+        let mut v = vec![0u8];
+        v.extend_from_slice(&(*bits as u64).to_le_bytes());
+        v
+      }
+      LookupTable::Xor8 => vec![1u8],
+      LookupTable::And8 => vec![2u8],
+    }
+  }
+
   /// The index whose entry is `w`, or `None` if `w` is not in the table.
   pub fn index_of(&self, w: u64) -> Option<u64> {
     match self {
@@ -1742,14 +1756,18 @@ impl<
     let n = witness.len().max(1).next_power_of_two();
     let mut mult = vec![0u64; size];
     for &w in witness {
-      let idx = table.index_of(w).ok_or_else(|| SpartanError::InvalidInputLength {
-        reason: format!("logup-gkr: witness value {w} is not in table {table:?}"),
-      })? as usize;
+      let idx = table
+        .index_of(w)
+        .ok_or_else(|| SpartanError::InvalidInputLength {
+          reason: format!("logup-gkr: witness value {w} is not in table {table:?}"),
+        })? as usize;
       mult[idx] += 1;
     }
-    let idx0 = table.index_of(0).ok_or_else(|| SpartanError::InvalidInputLength {
-      reason: format!("logup-gkr: table {table:?} lacks the padding value 0"),
-    })? as usize;
+    let idx0 = table
+      .index_of(0)
+      .ok_or_else(|| SpartanError::InvalidInputLength {
+        reason: format!("logup-gkr: table {table:?} lacks the padding value 0"),
+      })? as usize;
     mult[idx0] += (n - witness.len()) as u64;
     Ok(mult)
   }
@@ -1984,9 +2002,11 @@ impl<
         });
       }
       for &w in witness.iter() {
-        let idx = table.index_of(w).ok_or_else(|| SpartanError::InvalidInputLength {
-          reason: format!("logup-gkr multi: witness {b} value {w} is not in table {table:?}"),
-        })? as usize;
+        let idx = table
+          .index_of(w)
+          .ok_or_else(|| SpartanError::InvalidInputLength {
+            reason: format!("logup-gkr multi: witness {b} value {w} is not in table {table:?}"),
+          })? as usize;
         mult[idx] += 1;
       }
     }
@@ -2130,7 +2150,11 @@ impl<
     expected_wit_depths: &[usize],
     transcript: &mut E::TE,
   ) -> Result<MultiRangeClaims<E>, SpartanError> {
-    self.lookup_verify(&LookupTable::Range { bits }, expected_wit_depths, transcript)
+    self.lookup_verify(
+      &LookupTable::Range { bits },
+      expected_wit_depths,
+      transcript,
+    )
   }
 
   /// [`Self::verify`] for a general [`LookupTable`].
@@ -2333,8 +2357,7 @@ mod tests {
       pack(0x01, 0x02, 0x03),
     ];
     let mut tp = <E as Engine>::TE::new(b"logup_test");
-    let (proof, claims_p) =
-      LogUpRangeProof::<E>::lookup_prove(&table, &witness, &mut tp).unwrap();
+    let (proof, claims_p) = LogUpRangeProof::<E>::lookup_prove(&table, &witness, &mut tp).unwrap();
     let mut tv = <E as Engine>::TE::new(b"logup_test");
     let claims_v = proof.lookup_verify(&table, &mut tv).unwrap();
     assert_eq!(claims_p.wit_eval, claims_v.wit_eval);
@@ -2346,7 +2369,10 @@ mod tests {
       *slot = <E as Engine>::Scalar::from(w);
     }
     let mult = LogUpRangeProof::<E>::lookup_multiplicities(&table, &witness).unwrap();
-    let m_tbl: Vec<_> = mult.iter().map(|&m| <E as Engine>::Scalar::from(m)).collect();
+    let m_tbl: Vec<_> = mult
+      .iter()
+      .map(|&m| <E as Engine>::Scalar::from(m))
+      .collect();
     assert_eq!(claims_v.wit_eval, mle_eval(&w_tbl, &claims_v.wit_point));
     assert_eq!(claims_v.mult_eval, mle_eval(&m_tbl, &claims_v.mult_point));
   }
@@ -2381,7 +2407,10 @@ mod tests {
         assert_eq!(*eval, mle_eval(&w_tbl, point), "{table:?}");
       }
       let mult = LogUpMultiRangeProof::<E>::lookup_multiplicities(&table, &witnesses).unwrap();
-      let m_tbl: Vec<_> = mult.iter().map(|&m| <E as Engine>::Scalar::from(m)).collect();
+      let m_tbl: Vec<_> = mult
+        .iter()
+        .map(|&m| <E as Engine>::Scalar::from(m))
+        .collect();
       assert_eq!(claims_v.mult_eval, mle_eval(&m_tbl, &claims_v.mult_point));
     }
   }
@@ -2393,9 +2422,7 @@ mod tests {
     let bad = pack(0x3c, 0xa5, 0x00);
     let w: Vec<u64> = vec![bad, 0];
     let mut tp = <E as Engine>::TE::new(b"logup_test");
-    assert!(
-      LogUpMultiRangeProof::<E>::lookup_prove(&LookupTable::Xor8, &[&w], &mut tp).is_err()
-    );
+    assert!(LogUpMultiRangeProof::<E>::lookup_prove(&LookupTable::Xor8, &[&w], &mut tp).is_err());
     // Out-of-width packed values are not members either.
     assert!(LookupTable::Xor8.index_of(1u64 << 24).is_none());
     assert!(LookupTable::And8.index_of(pack(1, 1, 3)).is_none());
@@ -2431,7 +2458,11 @@ mod tests {
     )
     .unwrap();
     let mut tv = <E as Engine>::TE::new(b"logup_test");
-    assert!(proof.lookup_verify(&LookupTable::Xor8, &[2], &mut tv).is_err());
+    assert!(
+      proof
+        .lookup_verify(&LookupTable::Xor8, &[2], &mut tv)
+        .is_err()
+    );
   }
 
   #[test]

@@ -52,7 +52,9 @@ use crate::{
   start_span,
   sumcheck_modp::SumcheckProof,
   traits::{
-    mod_engine::{ModEngine, ModPCSEngineTrait, SmallValueBlock, SumcheckEngine, SumcheckField},
+    mod_engine::{
+      LookupBlock, ModEngine, ModPCSEngineTrait, SmallValueBlock, SumcheckEngine, SumcheckField,
+    },
     transcript::{ByteTranscript, TranscriptEngineTrait},
   },
 };
@@ -129,6 +131,28 @@ fn segment_relative_blocks(
         .map(|b| SmallValueBlock {
           start: b.start - seg.start,
           log_len: b.log_len,
+        })
+        .collect()
+    })
+    .collect()
+}
+
+/// [`segment_relative_blocks`] for lookup blocks: same rebasing of each
+/// block's `start` to the width segment that contains it.
+fn segment_relative_lookup_blocks(
+  segs: &[crate::imod_r1cs_modp::WidthSegment],
+  blocks: &[LookupBlock],
+) -> Vec<Vec<LookupBlock>> {
+  segs
+    .iter()
+    .map(|seg| {
+      blocks
+        .iter()
+        .filter(|b| b.start >= seg.start && b.start + b.size() <= seg.start + seg.size())
+        .map(|b| LookupBlock {
+          start: b.start - seg.start,
+          log_len: b.log_len,
+          table: b.table,
         })
         .collect()
     })
@@ -773,7 +797,7 @@ where
     let segs = pk.shape.width_segments();
     let mut seg_evals: Vec<MScalar<M>> = Vec::new();
     let eval_arg = if segs.is_empty() {
-      <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_blocks_rng(
+      <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_lookups_rng(
         &pk.ck,
         &mut transcript,
         log,
@@ -783,6 +807,8 @@ where
         &[&r_y[1..], &r_x[..]],
         &[&eval_w_bu, &v_q_bu],
         &[pk.shape.small_blocks.as_slice(), &[]],
+        &[pk.shape.lookup_blocks.as_slice(), &[]],
+        None,
         rng,
       )?
     } else {
@@ -822,7 +848,11 @@ where
       let mut blocks_ref: Vec<&[SmallValueBlock]> =
         seg_blocks.iter().map(|v| v.as_slice()).collect();
       blocks_ref.push(&[]);
-      <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_params_rng(
+      // Lookup blocks, rebased the same way.
+      let seg_lookups = segment_relative_lookup_blocks(segs, &pk.shape.lookup_blocks);
+      let mut lookups_ref: Vec<&[LookupBlock]> = seg_lookups.iter().map(|v| v.as_slice()).collect();
+      lookups_ref.push(&[]);
+      <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_lookups_rng(
         &pk.ck,
         &mut transcript,
         log,
@@ -832,7 +862,8 @@ where
         &points,
         &ev_refs,
         &blocks_ref,
-        &log_t_fs,
+        &lookups_ref,
+        Some(&log_t_fs),
         rng,
       )?
     };
@@ -1000,7 +1031,7 @@ where
     let v_q_bu = BigUint::from_bytes_le(&self.v_q.to_le_bytes());
     let segs = vk.shape.width_segments();
     if segs.is_empty() {
-      <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch_with_blocks(
+      <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch_with_lookups(
         &vk.vk_ee,
         &mut transcript,
         log,
@@ -1009,6 +1040,8 @@ where
         &[&eval_w_bu, &v_q_bu],
         &self.eval_arg,
         &[vk.shape.small_blocks.as_slice(), &[]],
+        &[vk.shape.lookup_blocks.as_slice(), &[]],
+        None,
       )?;
     } else {
       // Bind the per-segment evals to the R1CS: eval_w must equal the
@@ -1044,7 +1077,10 @@ where
       let mut blocks_ref: Vec<&[SmallValueBlock]> =
         seg_blocks.iter().map(|v| v.as_slice()).collect();
       blocks_ref.push(&[]);
-      <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch_with_params(
+      let seg_lookups = segment_relative_lookup_blocks(segs, &vk.shape.lookup_blocks);
+      let mut lookups_ref: Vec<&[LookupBlock]> = seg_lookups.iter().map(|v| v.as_slice()).collect();
+      lookups_ref.push(&[]);
+      <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch_with_lookups(
         &vk.vk_ee,
         &mut transcript,
         log,
@@ -1053,7 +1089,8 @@ where
         &ev_refs,
         &self.eval_arg,
         &blocks_ref,
-        &log_t_fs,
+        &lookups_ref,
+        Some(&log_t_fs),
       )?;
     }
     info!(elapsed_ms = %wqver_t.elapsed().as_millis(), "imod_modp_wq_verify");
@@ -1577,6 +1614,76 @@ mod tests {
     // The prover does not self-check blocks; the verifier must reject.
     let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
     assert!(proof.verify(&vk, &instance).is_err());
+  }
+
+  /// Lookup blocks end to end through the SNARK: witness slots [4, 8)
+  /// are asserted to hold Xor8-packed triples `a·2^16 + b·2^8 + (a^b)`
+  /// by the Mod-PCS lookup argument — no constraint rows. An honest
+  /// witness round-trips; a wrong XOR result fails `is_sat` and is
+  /// refused by the prover (the lookup prover checks membership).
+  #[test]
+  fn imod_modp_lookup_block_roundtrip_and_rejects() {
+    use crate::logup_gkr::LookupTable;
+    use crate::provider::pcs::integer_modpcs::IntEvalParams;
+    use crate::traits::mod_engine::LookupBlock;
+    let one = BigUint::from(1u32);
+    let num_cons = 4usize;
+    let num_vars = 8usize;
+    // Row 0: w[0]·w[1] = w[2] exactly; block [4, 8) is row-free.
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 2, one.clone())];
+    let mods = vec![
+      BigUint::from(0u32),
+      BigUint::from(2u32),
+      BigUint::from(2u32),
+      BigUint::from(2u32),
+    ];
+    let shape = IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, 0, mat_a, mat_b, mat_c, mods)
+      .unwrap()
+      .with_lookup_blocks(vec![LookupBlock {
+        start: 4,
+        log_len: 2,
+        table: LookupTable::Xor8,
+      }])
+      .unwrap();
+    let pack = |a: u64, b: u64, c: u64| -> u64 { (a << 16) | (b << 8) | c };
+    let mk = |v4: u64| -> (Vec<BigUint>, Vec<BigUint>) {
+      let w = [
+        3u64,
+        5,
+        15,
+        0,
+        v4,
+        pack(255, 255, 0),
+        pack(7, 9, 7 ^ 9),
+        0, // 0 = pack(0, 0, 0), a table member
+      ]
+      .iter()
+      .map(|x| BigUint::from(*x))
+      .collect();
+      let q = vec![BigUint::from(0u32); num_cons];
+      (w, q)
+    };
+    // Single-limb at log_t = 32 ≥ 24 so the packed 24-bit values are
+    // committable and the lookup's single-limb requirement holds.
+    let params = IntEvalParams::derive_no_limb_split(32, 3, 3).unwrap();
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
+
+    let (w, q) = mk(pack(1, 2, 3)); // 1 ^ 2 = 3: a member
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    shape.is_sat(&pk.ck, &instance, &witness).unwrap();
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    proof.verify(&vk, &instance).unwrap();
+
+    // Non-member: wrong XOR result. Rows still hold; `is_sat` rejects,
+    // and the prover refuses to build the lookup argument.
+    let (w, q) = mk(pack(1, 2, 4));
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    assert!(shape.is_sat(&pk.ck, &instance, &witness).is_err());
+    assert!(IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).is_err());
   }
 
   /// Wired circuit: the output of row 0 feeds into the input of row 1.

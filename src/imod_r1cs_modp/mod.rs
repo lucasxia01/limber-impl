@@ -15,7 +15,7 @@
 //! Invariants: `num_vars`, `num_cons` are powers of two,
 //! `num_vars ≥ 1 + num_io`, and `mods.len() == num_cons`.
 
-use crate::traits::mod_engine::SmallValueBlock;
+use crate::traits::mod_engine::{LookupBlock, SmallValueBlock};
 use crate::{
   errors::SpartanError,
   start_span,
@@ -178,6 +178,9 @@ pub struct IntModR1CSShapeModp<M: ModEngine> {
   pub(crate) compact: CompactMatrices,
   /// Aligned witness blocks asserted `< 2^16` by the Mod-PCS (no rows).
   pub(crate) small_blocks: Vec<SmallValueBlock>,
+  /// Aligned witness blocks asserted to be members of a lookup table by
+  /// the Mod-PCS (no rows); see [`LookupBlock`].
+  pub(crate) lookup_blocks: Vec<LookupBlock>,
   /// Width-grouped commitment segments tiling `[0, num_vars)`; empty means
   /// a single uniform segment (the default).
   pub(crate) width_segments: Vec<WidthSegment>,
@@ -256,6 +259,7 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
       mods,
       compact,
       small_blocks: Vec::new(),
+      lookup_blocks: Vec::new(),
       width_segments: Vec::new(),
       _phantom: core::marker::PhantomData,
     })
@@ -279,6 +283,27 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
   /// The declared small-value blocks.
   pub fn small_value_blocks(&self) -> &[SmallValueBlock] {
     &self.small_blocks
+  }
+
+  /// Declare aligned witness blocks whose values the Mod-PCS asserts to
+  /// be members of a lookup table (see [`LookupBlock`]) — the SNARK's
+  /// table lookup argument, costing no constraint rows. The witness
+  /// polynomial must be committed single-limb (values at most the limb
+  /// bound `2^log_t`), which every current table satisfies for the
+  /// default parameters since table entries stay below `2^24`. Blocks
+  /// enter the shape digest.
+  pub fn with_lookup_blocks(mut self, blocks: Vec<LookupBlock>) -> Result<Self, SpartanError> {
+    let n = self.num_vars.trailing_zeros() as usize;
+    for b in &blocks {
+      b.validate(n)?;
+    }
+    self.lookup_blocks = blocks;
+    Ok(self)
+  }
+
+  /// The declared lookup blocks.
+  pub fn lookup_block_decls(&self) -> &[LookupBlock] {
+    &self.lookup_blocks
   }
 
   /// Declare width-grouped commitment segments. They must tile
@@ -383,6 +408,17 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
         .iter()
         .all(|v| v.bits() <= 16)
     });
+    // Lookup blocks are likewise asserted by the Mod-PCS; check table
+    // membership here so a non-member witness is caught before proving.
+    let ok_lookups = self.lookup_blocks.iter().all(|b| {
+      W.w[b.start..b.start + b.size()].iter().all(|v| {
+        v.bits() <= 64
+          && b
+            .table
+            .index_of(v.iter_u64_digits().next().unwrap_or(0))
+            .is_some()
+      })
+    });
 
     let (comm_w_ok, comm_q_ok) = rayon::join(
       || -> Result<bool, SpartanError> {
@@ -423,6 +459,11 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
     if !ok_blocks {
       return Err(SpartanError::UnSat {
         reason: "IntMod-R1CS small-value block holds a value >= 2^16".to_string(),
+      });
+    }
+    if !ok_lookups {
+      return Err(SpartanError::UnSat {
+        reason: "IntMod-R1CS lookup block holds a value outside its table".to_string(),
       });
     }
     if !(comm_w_ok && comm_q_ok) {
@@ -470,6 +511,18 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
       h.update((s.start as u64).to_le_bytes());
       h.update((s.log_len as u64).to_le_bytes());
       h.update((s.log_t_f as u64).to_le_bytes());
+    }
+    // Hashed only when declared, so lookup-free shapes keep their
+    // pre-lookup digest (the empty case stays unambiguous: this tag
+    // never collides with the fixed-width fields above).
+    if !self.lookup_blocks.is_empty() {
+      h.update(b"lookup_blocks");
+      h.update((self.lookup_blocks.len() as u64).to_le_bytes());
+      for b in &self.lookup_blocks {
+        h.update((b.start as u64).to_le_bytes());
+        h.update((b.log_len as u64).to_le_bytes());
+        h.update(b.table.transcript_bytes());
+      }
     }
     h.finalize().into()
   }

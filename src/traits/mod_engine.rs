@@ -37,6 +37,7 @@
 
 use crate::{
   errors::SpartanError,
+  logup_gkr::LookupTable,
   traits::{
     Engine, PrimeFieldExt,
     transcript::{TranscriptEngineTrait, TranscriptReprTrait},
@@ -84,6 +85,52 @@ impl SmallValueBlock {
         reason: format!(
           "SmallValueBlock {{ start: {}, log_len: {} }} is misaligned or out of range for 2^{num_vars} coefficients",
           self.start, self.log_len
+        ),
+      })
+    }
+  }
+}
+
+/// An aligned block of witness indices `[start, start + 2^log_len)` whose
+/// committed integer values are asserted to be MEMBERS of a
+/// [`LookupTable`] — the SNARK-level lookup argument. A sound Mod-PCS
+/// discharges the assertion with one LogUp-GKR membership proof per
+/// distinct table (see `provider::pcs::integer_modpcs`), so, like
+/// [`SmallValueBlock`], it costs no constraint rows. For the packed
+/// bitwise tables ([`LookupTable::Xor8`] / [`LookupTable::And8`]) the
+/// caller recombines the operands and result from the packed value with
+/// linear constraints, which are free in Mod-R1CS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LookupBlock {
+  /// First witness index; must be a multiple of `2^log_len`.
+  pub start: usize,
+  /// Log2 of the block length.
+  pub log_len: usize,
+  /// The table every value in the block must belong to. Note that the
+  /// padding value `0` is a member of every current table, so zero-padded
+  /// tails inside a block are fine.
+  pub table: LookupTable,
+}
+
+impl LookupBlock {
+  /// Block length `2^log_len`.
+  pub fn size(&self) -> usize {
+    1usize << self.log_len
+  }
+
+  /// Check alignment and containment in a polynomial of `2^num_vars`
+  /// coefficients.
+  pub fn validate(&self, num_vars: usize) -> Result<(), SpartanError> {
+    let ok = self.log_len <= num_vars
+      && self.start.is_multiple_of(self.size())
+      && self.start + self.size() <= (1usize << num_vars);
+    if ok {
+      Ok(())
+    } else {
+      Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "LookupBlock {{ start: {}, log_len: {}, table: {:?} }} is misaligned or out of range for 2^{num_vars} coefficients",
+          self.start, self.log_len, self.table
         ),
       })
     }
@@ -631,6 +678,75 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
     Err(SpartanError::InternalError {
       reason: "this Mod-PCS does not support width-grouped commitment".to_string(),
     })
+  }
+
+  /// The widest batched prover surface: [`prove_batch_with_blocks_rng`]
+  /// (Self::prove_batch_with_blocks_rng) plus per-polynomial table-lookup
+  /// assertions — `lookups[i]` lists the aligned blocks of `polys[i]`
+  /// whose committed values must be members of their block's
+  /// [`LookupTable`]. `log_t_fs` is `None` for a uniform-width batch and
+  /// the per-polynomial segment widths for a width-grouped one (the
+  /// [`prove_batch_with_params_rng`](Self::prove_batch_with_params_rng)
+  /// path). The default supports no lookup blocks and otherwise forwards.
+  #[allow(clippy::too_many_arguments)]
+  fn prove_batch_with_lookups_rng(
+    ck: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[E::Scalar]],
+    evals: &[&BigUint],
+    blocks: &[&[SmallValueBlock]],
+    lookups: &[&[LookupBlock]],
+    log_t_fs: Option<&[usize]>,
+    rng: &mut dyn CryptoRngCore,
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    if lookups.iter().any(|l| !l.is_empty()) {
+      return Err(SpartanError::InternalError {
+        reason: "this Mod-PCS does not support table-lookup blocks".to_string(),
+      });
+    }
+    match log_t_fs {
+      None => Self::prove_batch_with_blocks_rng(
+        ck, transcript, log, comms, polys, blinds, points, evals, blocks, rng,
+      ),
+      Some(widths) => Self::prove_batch_with_params_rng(
+        ck, transcript, log, comms, polys, blinds, points, evals, blocks, widths, rng,
+      ),
+    }
+  }
+
+  /// Verify a [`prove_batch_with_lookups_rng`]
+  /// (Self::prove_batch_with_lookups_rng) argument; `blocks`, `lookups`,
+  /// and `log_t_fs` mirror the prover's declarations.
+  #[allow(clippy::too_many_arguments)]
+  fn verify_batch_with_lookups(
+    vk: &Self::VerifierKey,
+    transcript: &mut E::TE,
+    log: &mut crate::prime_sampler::PrimeAuditLog,
+    comms: &[&Self::Commitment],
+    points: &[&[E::Scalar]],
+    evals: &[&BigUint],
+    arg: &Self::BatchEvaluationArgument,
+    blocks: &[&[SmallValueBlock]],
+    lookups: &[&[LookupBlock]],
+    log_t_fs: Option<&[usize]>,
+  ) -> Result<(), SpartanError> {
+    if lookups.iter().any(|l| !l.is_empty()) {
+      return Err(SpartanError::InternalError {
+        reason: "this Mod-PCS does not support table-lookup blocks".to_string(),
+      });
+    }
+    match log_t_fs {
+      None => {
+        Self::verify_batch_with_blocks(vk, transcript, log, comms, points, evals, arg, blocks)
+      }
+      Some(widths) => Self::verify_batch_with_params(
+        vk, transcript, log, comms, points, evals, arg, blocks, widths,
+      ),
+    }
   }
 
   /// Exact number of P0-D prime-sampler invocations

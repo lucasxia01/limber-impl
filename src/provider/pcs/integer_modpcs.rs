@@ -21,6 +21,7 @@ use crate::prime_sampler::{
 use crate::provider::pcs::commit_backend::{BdBackend, CommitBackend, OpenTarget};
 use crate::{
   errors::SpartanError,
+  logup_gkr::LookupTable,
   polys::eq::EqPolynomial,
   provider::{
     T256DynPrimeEngine, T256HyraxEngine,
@@ -31,7 +32,7 @@ use crate::{
   start_span,
   traits::{
     PrimeFieldExt,
-    mod_engine::{ModPCSEngineTrait, SmallValueBlock, SumcheckEngine, SumcheckField},
+    mod_engine::{LookupBlock, ModPCSEngineTrait, SmallValueBlock, SumcheckEngine, SumcheckField},
     pcs::PCSEngineTrait,
     transcript::{ByteTranscript, TranscriptEngineTrait, TranscriptReprTrait},
   },
@@ -801,6 +802,12 @@ pub struct IntEvalBatchArgument<B: CommitBackend> {
   /// MLE evaluation `e2` at the transcript point (see
   /// [`small_block_claims`]). Empty for polynomials without blocks.
   pub(crate) small_block_evals: Vec<Vec<B::Scalar>>,
+  /// One [`TableLookupCheck`] per distinct table among the declared
+  /// [`LookupBlock`]s, in canonical group order (first appearance
+  /// scanning polynomials, then declaration order). Empty when no
+  /// lookup blocks are declared — in that case the transcript is
+  /// identical to the lookup-free protocol.
+  pub(crate) lookup_checks: Vec<TableLookupCheck<B>>,
 }
 
 impl<B: CommitBackend> IntEvalBatchArgument<B>
@@ -914,6 +921,28 @@ pub struct SharedRangeCheck<B: CommitBackend> {
   /// a nonzero block marked inactive fails its zero claim w.h.p.; a zero
   /// block marked active merely wastes prover work.
   pub(crate) active_blocks: Vec<Vec<bool>>,
+}
+
+/// One per-table lookup check of a batched Mod-PCS opening: ONE
+/// multi-witness LogUp-GKR membership argument whose witness trees are
+/// the declared [`LookupBlock`] regions of the opened polynomials'
+/// committed values, proven members of the group's
+/// [`crate::logup_gkr::LookupTable`]. The table side needs only the
+/// multiplicity commitment carried here — its entry MLE is evaluated in
+/// closed form by the verifier — and the witness-side claims are
+/// discharged against the polynomials' own chunk commitments through
+/// [`chunk_fold_point`], so no extra witness commitment exists. Groups
+/// are formed canonically from the public block declarations (see
+/// [`lookup_table_groups`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct TableLookupCheck<B: CommitBackend> {
+  /// Commitment to this table's multiplicity polynomial
+  /// (`2^domain_bits` entries).
+  pub(crate) mult_comm: B::Comm,
+  /// The multi-witness LogUp-GKR membership argument over the group's
+  /// blocks.
+  pub(crate) logup: crate::logup_gkr::LogUpMultiRangeProof<B::SE>,
 }
 
 /// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
@@ -1959,13 +1988,14 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let mut st = prove_one_poly::<HyBackend, T256DynPrimeEngine>(
       &ck.params, ck, transcript, log, poly, point, eval, rng,
     )?;
-    let (range_check, combined_open, _) = finish_batch_open::<HyBackend, T256DynPrimeEngine>(
+    let (range_check, combined_open, _, _) = finish_batch_open::<HyBackend, T256DynPrimeEngine>(
       &ck.params,
       ck,
       transcript,
       std::slice::from_mut(&mut st),
       &[&comm.inner],
       &[&blind.inner],
+      &[&[]],
       &[&[]],
       rng,
     )?;
@@ -1992,9 +2022,55 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     blocks: &[&[SmallValueBlock]],
     rng: &mut dyn CryptoRngCore,
   ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    let empty: Vec<&[LookupBlock]> = vec![&[]; polys.len()];
+    <Self as ModPCSEngineTrait<T256DynPrimeEngine>>::prove_batch_with_lookups_rng(
+      ck, transcript, log, comms, polys, blinds, points, evals, blocks, &empty, None, rng,
+    )
+  }
+
+  fn prove_batch_with_lookups_rng(
+    ck: &Self::CommitmentKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    blocks: &[&[SmallValueBlock]],
+    lookups: &[&[LookupBlock]],
+    log_t_fs: Option<&[usize]>,
+    rng: &mut dyn CryptoRngCore,
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    if let Some(widths) = log_t_fs {
+      let params_per: Vec<IntEvalParams> = widths
+        .iter()
+        .map(|&l| ck.params.narrowed(l))
+        .collect::<Result<_, _>>()?;
+      return Self::prove_batch_seg_lookups(
+        ck,
+        transcript,
+        log,
+        comms,
+        polys,
+        blinds,
+        points,
+        evals,
+        blocks,
+        lookups,
+        &params_per,
+        rng,
+      );
+    }
     let (_prove_span, prove_t) = start_span!("integer_modpcs_prove_batch");
     let n = polys.len();
-    if n == 0 || comms.len() != n || blinds.len() != n || points.len() != n || evals.len() != n {
+    if n == 0
+      || comms.len() != n
+      || blinds.len() != n
+      || points.len() != n
+      || evals.len() != n
+      || lookups.len() != n
+    {
       return Err(SpartanError::InternalError {
         reason: "IntegerModPCS::prove_batch: empty or mismatched inputs".to_string(),
       });
@@ -2019,7 +2095,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     }
     let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
     let blind_inners: Vec<_> = blinds.iter().map(|b| &b.inner).collect();
-    let (range_check, combined_open, small_block_evals) =
+    let (range_check, combined_open, small_block_evals, lookup_checks) =
       finish_batch_open::<HyBackend, T256DynPrimeEngine>(
         &ck.params,
         ck,
@@ -2028,6 +2104,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         &comm_inners,
         &blind_inners,
         blocks,
+        lookups,
         rng,
       )?;
     let per_poly = states
@@ -2045,6 +2122,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       range_check,
       combined_open,
       small_block_evals,
+      lookup_checks,
     })
   }
 
@@ -2080,6 +2158,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       &arg.combined_open,
       &[&[]],
       &[],
+      &[&[]],
+      &[],
     )?;
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify");
     Ok(())
@@ -2110,9 +2190,45 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     arg: &Self::BatchEvaluationArgument,
     blocks: &[&[SmallValueBlock]],
   ) -> Result<(), SpartanError> {
+    let empty: Vec<&[LookupBlock]> = vec![&[]; comms.len()];
+    <Self as ModPCSEngineTrait<T256DynPrimeEngine>>::verify_batch_with_lookups(
+      vk, transcript, log, comms, points, evals, arg, blocks, &empty, None,
+    )
+  }
+
+  fn verify_batch_with_lookups(
+    vk: &Self::VerifierKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
+    comms: &[&Self::Commitment],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    arg: &Self::BatchEvaluationArgument,
+    blocks: &[&[SmallValueBlock]],
+    lookups: &[&[LookupBlock]],
+    log_t_fs: Option<&[usize]>,
+  ) -> Result<(), SpartanError> {
+    if let Some(widths) = log_t_fs {
+      let params_per: Vec<IntEvalParams> = widths
+        .iter()
+        .map(|&l| vk.params.narrowed(l))
+        .collect::<Result<_, _>>()?;
+      return Self::verify_batch_seg_lookups(
+        vk,
+        transcript,
+        log,
+        comms,
+        points,
+        evals,
+        arg,
+        blocks,
+        lookups,
+        &params_per,
+      );
+    }
     let (_verify_span, verify_t) = start_span!("integer_modpcs_verify_batch");
     let n = arg.per_poly.len();
-    if comms.len() != n || points.len() != n || evals.len() != n {
+    if comms.len() != n || points.len() != n || evals.len() != n || lookups.len() != n {
       return Err(SpartanError::InvalidSumcheckProof);
     }
     let mut vph1s: Vec<VerifyPhase1> = Vec::with_capacity(n);
@@ -2158,6 +2274,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       &arg.combined_open,
       blocks,
       &arg.small_block_evals,
+      lookups,
+      &arg.lookup_checks,
     )?;
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify_batch");
     Ok(())
@@ -2293,6 +2411,31 @@ impl IntegerModPCS {
     params_per: &[IntEvalParams],
     rng: &mut dyn CryptoRngCore,
   ) -> Result<IntEvalBatchArgument<HyBackend>, SpartanError> {
+    let empty: Vec<&[LookupBlock]> = vec![&[]; polys.len()];
+    Self::prove_batch_seg_lookups(
+      ck, transcript, log, comms, polys, blinds, points, evals, blocks, &empty, params_per, rng,
+    )
+  }
+
+  /// [`IntegerModPCS::prove_batch_seg`] plus per-polynomial
+  /// [`LookupBlock`] assertions; like small-value blocks, lookup blocks
+  /// may only be declared on polynomials committed at the batch width
+  /// (and, additionally, single-limb ones — see [`prove_table_lookups`]).
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn prove_batch_seg_lookups(
+    ck: &IntegerModCommitmentKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
+    comms: &[&IntegerModCommitment],
+    polys: &[&[BigUint]],
+    blinds: &[&IntegerModBlind],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    blocks: &[&[SmallValueBlock]],
+    lookups: &[&[LookupBlock]],
+    params_per: &[IntEvalParams],
+    rng: &mut dyn CryptoRngCore,
+  ) -> Result<IntEvalBatchArgument<HyBackend>, SpartanError> {
     let n = polys.len();
     if n == 0
       || comms.len() != n
@@ -2300,6 +2443,7 @@ impl IntegerModPCS {
       || points.len() != n
       || evals.len() != n
       || blocks.len() != n
+      || lookups.len() != n
       || params_per.len() != n
     {
       return Err(SpartanError::InternalError {
@@ -2329,7 +2473,7 @@ impl IntegerModPCS {
     }
     let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
     let blind_inners: Vec<_> = blinds.iter().map(|b| &b.inner).collect();
-    let (range_check, combined_open, small_block_evals) =
+    let (range_check, combined_open, small_block_evals, lookup_checks) =
       finish_batch_open::<HyBackend, T256DynPrimeEngine>(
         &ck.params,
         ck,
@@ -2338,6 +2482,7 @@ impl IntegerModPCS {
         &comm_inners,
         &blind_inners,
         blocks,
+        lookups,
         rng,
       )?;
     let per_poly = states
@@ -2354,6 +2499,7 @@ impl IntegerModPCS {
       range_check,
       combined_open,
       small_block_evals,
+      lookup_checks,
     })
   }
 
@@ -2370,11 +2516,32 @@ impl IntegerModPCS {
     blocks: &[&[SmallValueBlock]],
     params_per: &[IntEvalParams],
   ) -> Result<(), SpartanError> {
+    let empty: Vec<&[LookupBlock]> = vec![&[]; comms.len()];
+    Self::verify_batch_seg_lookups(
+      vk, transcript, log, comms, points, evals, arg, blocks, &empty, params_per,
+    )
+  }
+
+  /// Verifier mirror of [`IntegerModPCS::prove_batch_seg_lookups`].
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn verify_batch_seg_lookups(
+    vk: &IntegerModVerifierKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    log: &mut PrimeAuditLog,
+    comms: &[&IntegerModCommitment],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    arg: &IntEvalBatchArgument<HyBackend>,
+    blocks: &[&[SmallValueBlock]],
+    lookups: &[&[LookupBlock]],
+    params_per: &[IntEvalParams],
+  ) -> Result<(), SpartanError> {
     let n = arg.per_poly.len();
     if comms.len() != n
       || points.len() != n
       || evals.len() != n
       || blocks.len() != n
+      || lookups.len() != n
       || params_per.len() != n
     {
       return Err(SpartanError::InvalidSumcheckProof);
@@ -2422,6 +2589,8 @@ impl IntegerModPCS {
       &arg.combined_open,
       blocks,
       &arg.small_block_evals,
+      lookups,
+      &arg.lookup_checks,
     )?;
     Ok(())
   }
@@ -2624,13 +2793,14 @@ where
       eval,
       rng,
     )?;
-    let (range_check, combined_open, _) = finish_batch_open::<BdBackend<SE>, ME>(
+    let (range_check, combined_open, _, _) = finish_batch_open::<BdBackend<SE>, ME>(
       &ck.params,
       &(),
       transcript,
       std::slice::from_mut(&mut st),
       &[&comm.root],
       &[blind],
+      &[&[]],
       &[&[]],
       rng,
     )?;
@@ -2686,16 +2856,19 @@ where
       )?);
     }
     let comm_roots: Vec<_> = comms.iter().map(|c| &c.root).collect();
-    let (range_check, combined_open, small_block_evals) = finish_batch_open::<BdBackend<SE>, ME>(
-      &ck.params,
-      &(),
-      transcript,
-      &mut states,
-      &comm_roots,
-      blinds,
-      blocks,
-      rng,
-    )?;
+    let empty_lookups: Vec<&[LookupBlock]> = vec![&[]; n];
+    let (range_check, combined_open, small_block_evals, lookup_checks) =
+      finish_batch_open::<BdBackend<SE>, ME>(
+        &ck.params,
+        &(),
+        transcript,
+        &mut states,
+        &comm_roots,
+        blinds,
+        blocks,
+        &empty_lookups,
+        rng,
+      )?;
     let per_poly = states
       .into_iter()
       .map(|st| IntEvalPerPolyArgument {
@@ -2711,6 +2884,7 @@ where
       range_check,
       combined_open,
       small_block_evals,
+      lookup_checks,
     })
   }
 
@@ -2744,6 +2918,8 @@ where
       &[arg.ab_comms.as_slice()],
       &arg.range_check,
       &arg.combined_open,
+      &[&[]],
+      &[],
       &[&[]],
       &[],
     )?;
@@ -2813,6 +2989,7 @@ where
       .iter()
       .map(|pp| pp.ab_comms.as_slice())
       .collect();
+    let empty_lookups: Vec<&[LookupBlock]> = vec![&[]; n];
     finish_batch_verify::<BdBackend<SE>, ME>(
       &vk.params,
       &(),
@@ -2824,6 +3001,8 @@ where
       &arg.combined_open,
       blocks,
       &arg.small_block_evals,
+      &empty_lookups,
+      &arg.lookup_checks,
     )?;
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_bd_verify_batch");
     Ok(())
@@ -3495,12 +3674,14 @@ fn finish_batch_open<
   comms: &[&B::Comm],
   blinds: &[&B::Blind],
   blocks: &[&[SmallValueBlock]],
+  lookups: &[&[LookupBlock]],
   rng: &mut dyn CryptoRngCore,
 ) -> Result<
   (
     SharedRangeCheck<B>,
     CombinedBatchOpen<B>,
     Vec<Vec<B::Scalar>>,
+    Vec<TableLookupCheck<B>>,
   ),
   SpartanError,
 >
@@ -3581,6 +3762,14 @@ where
   // commitment), so the range check emits no value claims.
   debug_assert!(rc_art.value_claims.is_empty());
 
+  // Table-lookup checks: one LogUp-GKR membership argument per distinct
+  // table over the declared blocks, transcript-ordered right after the
+  // shared range check (a no-op leaving the transcript untouched when
+  // no blocks are declared). Witness claims land on the member
+  // polynomials' own chunk commitments below.
+  let (lookup_checks, lookup_art) =
+    prove_table_lookups::<B, ME>(backend_ck, params, states, lookups, transcript, rng)?;
+
   // Per poly: fold every f_limb claim into a chunk claim on the input
   // commitment (`f_limb(z) · α = chunk(z ++ x_*)`), then append each
   // target's GKR/top/zero-pad chunk claims from the range check — they
@@ -3625,6 +3814,12 @@ where
       blk_evals.push(e2);
     }
     small_block_evals.push(blk_evals);
+    // Lookup witness claims of this polynomial's blocks — claims on the
+    // same chunk commitment, appended after the small-value claims.
+    let lk_cl = &lookup_art.wit_claims[p];
+    for (z, y) in lk_cl.points.iter().zip(lk_cl.evals.iter()) {
+      cl.push(z.clone(), *y);
+    }
     f_target_claims.push(cl);
 
     let mut per_layer = Vec::with_capacity(2 * st.t_layers);
@@ -3692,10 +3887,15 @@ where
     &rc_art.mult_data,
     &rc_art.mult_claims,
   ));
+  // Lookup multiplicity commitments, in canonical group order.
+  for (check, (mult_fq, blind, data, claims)) in lookup_checks.iter().zip(lookup_art.groups.iter())
+  {
+    bo_targets.push((&check.mult_comm, mult_fq.as_slice(), blind, data, claims));
+  }
   let combined_open = prove_combined_batch_open::<B>(backend_ck, &mut bsub, &bo_targets, rng)?;
   info!(elapsed_ms = %bo_t.elapsed().as_millis(), "imod_pcs_batched_opens");
 
-  Ok((range_check, combined_open, small_block_evals))
+  Ok((range_check, combined_open, small_block_evals, lookup_checks))
 }
 
 /// Per-polynomial verifier state: the accumulated open claims plus the
@@ -4056,6 +4256,8 @@ fn finish_batch_verify<
   combined_open: &CombinedBatchOpen<B>,
   blocks: &[&[SmallValueBlock]],
   small_block_evals: &[Vec<B::Scalar>],
+  lookups: &[&[LookupBlock]],
+  lookup_checks: &[TableLookupCheck<B>],
 ) -> Result<(), SpartanError>
 where
   B::Scalar: crate::big_num::DelayedReduction<B::Scalar>,
@@ -4096,6 +4298,12 @@ where
   // Every batch is precommitted, so no value claims to route.
   debug_assert!(rc_claims.value_claims.is_empty());
   info!(elapsed_ms = %vrc_t.elapsed().as_millis(), "imod_pcs_verify_rc");
+
+  // Table-lookup checks: mirror of the prover's position right after
+  // the shared range check (a transcript no-op when no blocks are
+  // declared, which also rejects proofs carrying undeclared checks).
+  let (lk_wit_claims, lk_mult_targets) =
+    verify_table_lookups::<B, ME>(params, verifiers, lookups, lookup_checks, transcript)?;
 
   // Per poly: fold every f_limb claim into a chunk claim on the input
   // commitment and append each target's GKR/top/zero-pad chunk claims
@@ -4143,6 +4351,12 @@ where
         cl.push(z, y);
       }
     }
+    // Lookup witness claims of this polynomial's blocks (mirror of the
+    // prover's claim assembly).
+    let lk_cl = &lk_wit_claims[p];
+    for (z, y) in lk_cl.points.iter().zip(lk_cl.evals.iter()) {
+      cl.push(z.clone(), *y);
+    }
     f_target_claims.push(cl);
     f_log_stride.push(d.log_stride);
 
@@ -4179,6 +4393,10 @@ where
     }
   }
   bo_targets.push((&range_check.mult_comm, CHUNK_BITS, &rc_claims.mult_claims));
+  // Lookup multiplicity commitments, in canonical group order.
+  for (check, (num_vars, claims)) in lookup_checks.iter().zip(lk_mult_targets.iter()) {
+    bo_targets.push((&check.mult_comm, *num_vars, claims));
+  }
   verify_combined_batch_open::<B>(backend_vk, &mut bsub, &bo_targets, combined_open)?;
   info!(elapsed_ms = %vbo_t.elapsed().as_millis(), "imod_pcs_verify_batched_opens");
   Ok(())
@@ -5621,6 +5839,291 @@ where
   })
 }
 
+/// Canonical grouping of the declared [`LookupBlock`]s by table: tables
+/// in first-appearance order scanning polynomials and, within a
+/// polynomial, declaration order; each group lists its `(poly, block)`
+/// members in that same scan order. Both sides derive the grouping from
+/// the public declarations; group `g` is proven by
+/// `IntEvalBatchArgument::lookup_checks[g]`.
+fn lookup_table_groups(
+  lookups: &[&[LookupBlock]],
+) -> Vec<(LookupTable, Vec<(usize, LookupBlock)>)> {
+  let mut groups: Vec<(LookupTable, Vec<(usize, LookupBlock)>)> = Vec::new();
+  for (p, blks) in lookups.iter().enumerate() {
+    for blk in blks.iter() {
+      match groups.iter_mut().find(|(t, _)| *t == blk.table) {
+        Some((_, members)) => members.push((p, *blk)),
+        None => groups.push((blk.table, vec![(p, *blk)])),
+      }
+    }
+  }
+  groups
+}
+
+/// Spawn the F-side sub-transcript of the table-lookup checks, seeded
+/// from the parent and binding the public block declarations plus every
+/// group's multiplicity commitment — all before any challenge (in
+/// particular each group's LogUp `r`) is squeezed. Both prover and
+/// verifier reconstruct it identically.
+fn spawn_lookup_subtranscript<
+  'a,
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<2>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
+  parent: &mut Keccak256Transcript<ME>,
+  groups: &[(LookupTable, Vec<(usize, LookupBlock)>)],
+  mult_comms: impl Iterator<Item = &'a B::Comm>,
+) -> Result<<B::SE as SumcheckEngine>::TE, SpartanError> {
+  let seed = parent.squeeze_bytes(b"lookup_seed")?;
+  let mut sub =
+    <<B::SE as SumcheckEngine>::TE as TranscriptEngineTrait<B::SE>>::new(b"table_lookups");
+  sub.absorb_bytes(b"seed", &seed);
+  for (table, members) in groups {
+    sub.absorb_bytes(b"lookup_table", &table.transcript_bytes());
+    for (p, blk) in members {
+      let mut enc = Vec::with_capacity(24);
+      enc.extend_from_slice(&(*p as u64).to_le_bytes());
+      enc.extend_from_slice(&(blk.start as u64).to_le_bytes());
+      enc.extend_from_slice(&(blk.log_len as u64).to_le_bytes());
+      sub.absorb_bytes(b"lookup_block", &enc);
+    }
+  }
+  for mc in mult_comms {
+    sub.absorb_bytes(b"lookup_mult_comm", &B::comm_transcript_bytes(mc));
+  }
+  Ok(sub)
+}
+
+/// Map one lookup witness-tree claim onto its polynomial's chunk
+/// oracle. The block's values sit at coefficient indices
+/// `[start, start + 2^log_len)` of a SINGLE-LIMB polynomial, whose
+/// committed-chunk layout puts the chunk axis below the coefficient
+/// axis, so `value(prefix, ρ) · α = chunk(prefix ++ ρ ++ x_*)` with
+/// `(x_*, α)` from [`chunk_fold_point`] — the fold is definitional for
+/// the committed-chunk layout, its padding slots pinned zero by the
+/// shared range check's `range_zpad` claims.
+fn lookup_chunk_claim<F: ff::PrimeField>(
+  num_vars: usize,
+  log_stride: usize,
+  blk: &LookupBlock,
+  point: &[F],
+  eval: F,
+) -> (Vec<F>, F) {
+  let (fold_pt, alpha) = chunk_fold_point::<F>(log_stride);
+  let mut full: Vec<F> = bool_point_of_index::<F>(blk.start >> blk.log_len, num_vars - blk.log_len);
+  full.extend_from_slice(point);
+  full.extend_from_slice(&fold_pt);
+  (full, alpha * eval)
+}
+
+/// Prover-side artifacts of the table-lookup checks that feed the final
+/// batched opens: per-polynomial witness claims on the polynomials' own
+/// chunk commitments, and per-group multiplicity polynomial + blind +
+/// retained data + claims.
+struct LookupProverArtifacts<B: CommitBackend> {
+  wit_claims: Vec<OpenClaims<B::Scalar>>,
+  groups: Vec<(Vec<B::Scalar>, B::Blind, B::Data, OpenClaims<B::Scalar>)>,
+}
+
+/// Prover side of the table-lookup checks covering all [`LookupBlock`]s
+/// of one batched Mod-PCS opening: ONE multi-witness LogUp-GKR
+/// membership argument per distinct table, in canonical group order
+/// (see [`lookup_table_groups`]). Witness values are read from the
+/// polynomials' committed integer coefficients — lookup polynomials
+/// must be single-limb, so the coefficient axis holds the values
+/// themselves — and every evaluation obligation is returned as a CLAIM
+/// for the caller's combined batched open. When no blocks are declared
+/// this is a no-op that leaves the transcript untouched.
+fn prove_table_lookups<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<2>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
+  backend_ck: &B::Ck,
+  params: &IntEvalParams,
+  states: &[PerPolyProver<B>],
+  lookups: &[&[LookupBlock]],
+  parent: &mut Keccak256Transcript<ME>,
+  rng: &mut dyn CryptoRngCore,
+) -> Result<(Vec<TableLookupCheck<B>>, LookupProverArtifacts<B>), SpartanError> {
+  let mut art = LookupProverArtifacts::<B> {
+    wit_claims: vec![OpenClaims::<B::Scalar>::default(); states.len()],
+    groups: Vec::new(),
+  };
+  let groups = lookup_table_groups(lookups);
+  if groups.is_empty() {
+    return Ok((Vec::new(), art));
+  }
+  if lookups.len() > states.len() {
+    return Err(SpartanError::InvalidInputLength {
+      reason: "table lookups: more lookup declarations than polynomials".to_string(),
+    });
+  }
+
+  // Witness extraction: each block's committed values as u64. Every
+  // table keeps its entries below 2^24, so a value that does not fit
+  // u64 cannot be a member; actual membership is checked by
+  // `lookup_multiplicities`.
+  let (_lk_span, lk_t) = start_span!("lookup_mult_commit");
+  let mut wit_vals: Vec<Vec<Vec<u64>>> = Vec::with_capacity(groups.len());
+  for (_, members) in &groups {
+    let mut tree_vals = Vec::with_capacity(members.len());
+    for (p, blk) in members {
+      let st = &states[*p];
+      if st.numlimb_var != 0 {
+        return Err(SpartanError::InvalidInputLength {
+          reason: format!(
+            "table lookups: polynomial {p} is limb-split (numlimb_var {}), but lookup blocks address committed values and need a single-limb polynomial",
+            st.numlimb_var
+          ),
+        });
+      }
+      let num_vars = ceil_log2(st.f_limb.len().max(1));
+      blk.validate(num_vars)?;
+      let vals: Vec<u64> = st.f_limb[blk.start..blk.start + blk.size()]
+        .iter()
+        .map(|v| {
+          if v.bits() <= 64 {
+            Ok(v.iter_u64_digits().next().unwrap_or(0))
+          } else {
+            Err(SpartanError::InvalidInputLength {
+              reason: format!(
+                "table lookups: polynomial {p} holds a value of {} bits in a lookup block; no table entry is that large",
+                v.bits()
+              ),
+            })
+          }
+        })
+        .collect::<Result<_, _>>()?;
+      tree_vals.push(vals);
+    }
+    wit_vals.push(tree_vals);
+  }
+
+  // Per-group multiplicity tables, committed before the sub-transcript
+  // squeezes any LogUp challenge (multiplicities chosen after a
+  // challenge would break the lookup identity).
+  let mut mult_data: Vec<(Vec<B::Scalar>, B::Blind, B::Comm, B::Data)> =
+    Vec::with_capacity(groups.len());
+  for ((table, _), tree_vals) in groups.iter().zip(wit_vals.iter()) {
+    let refs: Vec<&[u64]> = tree_vals.iter().map(|v| v.as_slice()).collect();
+    let mult =
+      crate::logup_gkr::LogUpMultiRangeProof::<B::SE>::lookup_multiplicities(table, &refs)?;
+    let mult_fq: Vec<B::Scalar> = mult.iter().map(|&m| B::Scalar::from(m)).collect();
+    let blind = B::blind_with_rng(backend_ck, mult_fq.len(), rng);
+    let (comm, data) = B::commit(backend_ck, &mult_fq, &blind, true)?;
+    mult_data.push((mult_fq, blind, comm, data));
+  }
+  info!(elapsed_ms = %lk_t.elapsed().as_millis(), "lookup_mult_commit");
+
+  let mut sub =
+    spawn_lookup_subtranscript::<B, ME>(parent, &groups, mult_data.iter().map(|(_, _, c, _)| c))?;
+
+  // One multi-witness LogUp-GKR per table, in group order; its reduced
+  // claims become batched-open claims on the member polynomials' chunk
+  // commitments and on the group's multiplicity commitment.
+  let (_lkg_span, lkg_t) = start_span!("lookup_logup_gkr");
+  let log_stride = chunk_stride(params.log_t).trailing_zeros() as usize;
+  let mut checks: Vec<TableLookupCheck<B>> = Vec::with_capacity(groups.len());
+  for (((table, members), tree_vals), (mult_fq, blind, comm, data)) in
+    groups.iter().zip(wit_vals.iter()).zip(mult_data)
+  {
+    let refs: Vec<&[u64]> = tree_vals.iter().map(|v| v.as_slice()).collect();
+    let (logup, claims) =
+      crate::logup_gkr::LogUpMultiRangeProof::<B::SE>::lookup_prove(table, &refs, &mut sub)?;
+    for ((p, blk), (point, eval)) in members.iter().zip(claims.wit_claims.iter()) {
+      let num_vars = ceil_log2(states[*p].f_limb.len().max(1));
+      let (full, y) = lookup_chunk_claim::<B::Scalar>(num_vars, log_stride, blk, point, *eval);
+      art.wit_claims[*p].push(full, y);
+    }
+    let mut mult_claims = OpenClaims::<B::Scalar>::default();
+    mult_claims.push(claims.mult_point.clone(), claims.mult_eval);
+    art.groups.push((mult_fq, blind, data, mult_claims));
+    checks.push(TableLookupCheck {
+      mult_comm: comm,
+      logup,
+    });
+  }
+  info!(elapsed_ms = %lkg_t.elapsed().as_millis(), "lookup_logup_gkr");
+
+  Ok((checks, art))
+}
+
+/// Verifier-side mirror of [`prove_table_lookups`]. Re-derives the
+/// grouping from the public declarations, pins every witness tree depth
+/// to its block's public `log_len`, verifies each group's LogUp (the
+/// table side against the closed-form entry MLE), and returns the
+/// per-polynomial chunk-oracle claims plus, per group, the multiplicity
+/// commitment's `(num_vars, claims)` for the combined open.
+fn verify_table_lookups<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<2>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
+  params: &IntEvalParams,
+  verifiers: &[PerPolyVerifier<B::Scalar>],
+  lookups: &[&[LookupBlock]],
+  checks: &[TableLookupCheck<B>],
+  parent: &mut Keccak256Transcript<ME>,
+) -> Result<
+  (
+    Vec<OpenClaims<B::Scalar>>,
+    Vec<(usize, OpenClaims<B::Scalar>)>,
+  ),
+  SpartanError,
+> {
+  let mut wit_claims: Vec<OpenClaims<B::Scalar>> =
+    vec![OpenClaims::<B::Scalar>::default(); verifiers.len()];
+  let groups = lookup_table_groups(lookups);
+  // A proof may not carry lookup checks beyond the declared groups (nor
+  // omit any): the grouping is public.
+  if groups.len() != checks.len() {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
+  if groups.is_empty() {
+    return Ok((wit_claims, Vec::new()));
+  }
+  if lookups.len() > verifiers.len() {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
+  for (_, members) in &groups {
+    for (p, blk) in members {
+      let v = &verifiers[*p];
+      if v.numlimb_var != 0 {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+      blk.validate(v.num_vars)?;
+    }
+  }
+
+  let mut sub =
+    spawn_lookup_subtranscript::<B, ME>(parent, &groups, checks.iter().map(|c| &c.mult_comm))?;
+
+  let log_stride = chunk_stride(params.log_t).trailing_zeros() as usize;
+  let mut mult_targets: Vec<(usize, OpenClaims<B::Scalar>)> = Vec::with_capacity(groups.len());
+  for ((table, members), check) in groups.iter().zip(checks.iter()) {
+    let depths: Vec<usize> = members.iter().map(|(_, blk)| blk.log_len).collect();
+    let claims = check.logup.lookup_verify(table, &depths, &mut sub)?;
+    for ((p, blk), (point, eval)) in members.iter().zip(claims.wit_claims.iter()) {
+      let (full, y) =
+        lookup_chunk_claim::<B::Scalar>(verifiers[*p].num_vars, log_stride, blk, point, *eval);
+      wit_claims[*p].push(full, y);
+    }
+    let mut mult_claims = OpenClaims::<B::Scalar>::default();
+    mult_claims.push(claims.mult_point.clone(), claims.mult_eval);
+    mult_targets.push((table.domain_bits(), mult_claims));
+  }
+
+  Ok((wit_claims, mult_targets))
+}
+
 /// Absorb a `BigInt` into a `ByteTranscript` as `(sign_byte, LE
 /// magnitude bytes)`. Sign byte is `0` for non-negative, `1` for
 /// negative. Length-prefixed by usize → 8 bytes LE so re-derivation is
@@ -6555,6 +7058,182 @@ mod tests {
       )
       .is_err(),
       "block must reject a value >= 2^16 on a narrow segment"
+    );
+  }
+
+  /// Table-lookup blocks on a single-limb polynomial: an honest poly —
+  /// Xor8-packed triples in the first half, And8-packed in the second,
+  /// exercising two table groups in one opening — round-trips, and the
+  /// three ways to cheat all fail: a non-member value is refused at
+  /// PROVE time (the lookup prover checks membership), a verifier given
+  /// swapped table declarations rejects, and a verifier given no
+  /// declarations rejects a proof that carries lookup checks.
+  #[test]
+  fn lookup_blocks_round_trip_and_bind_tables() {
+    let dp = crypto_bigint::modular::FixedMontyParams::<2>::new(
+      crypto_bigint::Odd::new(crypto_bigint::U128::MAX >> 1).unwrap(),
+    );
+    let p: BigUint = (BigUint::from(1u32) << 127u32) - BigUint::from(1u32);
+    let num_vars = 6usize;
+    let n = 1usize << num_vars;
+    // Single-limb at log_t = 32 ≥ 24, so packed 24-bit entries are
+    // valid committed values and numlimb_var = 0 as lookups require.
+    let params = IntEvalParams::derive_no_limb_split(32, 3, num_vars).unwrap();
+    assert_eq!(params.numlimb_var, 0);
+    let (ck, vk) = IntegerModPCS::setup_with_params(b"lk", n, 32, params.clone()).unwrap();
+
+    let pack = |a: u64, b: u64, c: u64| -> u64 { (a << 16) | (b << 8) | c };
+    let poly: Vec<BigUint> = (0..n)
+      .map(|i| {
+        let (a, b) = ((7 * i as u64 + 3) % 256, (5 * i as u64 + 11) % 256);
+        let v = if i < n / 2 {
+          pack(a, b, a ^ b)
+        } else {
+          pack(a, b, a & b)
+        };
+        BigUint::from(v)
+      })
+      .collect();
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dp, ((i as u64) * 7 + 3) % 101))
+      .collect();
+    let ev = |poly: &[BigUint], pt: &[DP]| -> BigUint {
+      let ip: Vec<BigUint> = pt.iter().map(dyn_to_biguint).collect();
+      integer_mle_evaluate(poly, &ip)
+        .mod_floor(&BigInt::from(p.clone()))
+        .to_biguint()
+        .unwrap()
+    };
+    let e = ev(&poly, &point);
+    let bl = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm = IntegerModPCS::commit_seg(&ck, &poly, &bl, &params).unwrap();
+
+    let decls = [
+      LookupBlock {
+        start: 0,
+        log_len: num_vars - 1,
+        table: LookupTable::Xor8,
+      },
+      LookupBlock {
+        start: n / 2,
+        log_len: num_vars - 1,
+        table: LookupTable::And8,
+      },
+    ];
+    let lks: [&[LookupBlock]; 1] = [&decls];
+    let nb: [&[SmallValueBlock]; 1] = [&[]];
+    let pp = std::slice::from_ref(&params);
+
+    let mut tp = <ME as SumcheckEngine>::TE::new_with_params(b"lk", dp);
+    let arg = IntegerModPCS::prove_batch_seg_lookups(
+      &ck,
+      &mut tp,
+      &mut audit_log(),
+      &[&comm],
+      &[&poly],
+      &[&bl],
+      &[&point],
+      &[&e],
+      &nb,
+      &lks,
+      pp,
+      &mut rand::thread_rng(),
+    )
+    .unwrap();
+    assert_eq!(arg.lookup_checks.len(), 2, "one check per distinct table");
+    let mut tv = <ME as SumcheckEngine>::TE::new_with_params(b"lk", dp);
+    IntegerModPCS::verify_batch_seg_lookups(
+      &vk,
+      &mut tv,
+      &mut audit_log(),
+      &[&comm],
+      &[&point],
+      &[&e],
+      &arg,
+      &nb,
+      &lks,
+      pp,
+    )
+    .unwrap();
+
+    // Swapped table declarations: same group count and depths, but the
+    // sub-transcript and the closed-form table check both pin the
+    // tables, so verification must fail.
+    let swapped = [
+      LookupBlock {
+        table: LookupTable::And8,
+        ..decls[0]
+      },
+      LookupBlock {
+        table: LookupTable::Xor8,
+        ..decls[1]
+      },
+    ];
+    let lks_sw: [&[LookupBlock]; 1] = [&swapped];
+    let mut tv2 = <ME as SumcheckEngine>::TE::new_with_params(b"lk", dp);
+    assert!(
+      IntegerModPCS::verify_batch_seg_lookups(
+        &vk,
+        &mut tv2,
+        &mut audit_log(),
+        &[&comm],
+        &[&point],
+        &[&e],
+        &arg,
+        &nb,
+        &lks_sw,
+        pp,
+      )
+      .is_err(),
+      "swapped table declarations must be rejected"
+    );
+
+    // No declarations: a proof carrying lookup checks must be rejected
+    // (group count mismatch), not silently accepted.
+    let lks_none: [&[LookupBlock]; 1] = [&[]];
+    let mut tv3 = <ME as SumcheckEngine>::TE::new_with_params(b"lk", dp);
+    assert!(
+      IntegerModPCS::verify_batch_seg_lookups(
+        &vk,
+        &mut tv3,
+        &mut audit_log(),
+        &[&comm],
+        &[&point],
+        &[&e],
+        &arg,
+        &nb,
+        &lks_none,
+        pp,
+      )
+      .is_err(),
+      "undeclared lookup checks must be rejected"
+    );
+
+    // A non-member value (wrong XOR result; still < 2^24, so every
+    // chunk is in range and the commitment is valid) is refused at
+    // prove time.
+    let mut bad = poly.clone();
+    bad[3] = BigUint::from(pack(1, 2, 4)); // 1 ^ 2 = 3, not 4
+    let comm_bad = IntegerModPCS::commit_seg(&ck, &bad, &bl, &params).unwrap();
+    let e_bad = ev(&bad, &point);
+    let mut tp2 = <ME as SumcheckEngine>::TE::new_with_params(b"lk", dp);
+    assert!(
+      IntegerModPCS::prove_batch_seg_lookups(
+        &ck,
+        &mut tp2,
+        &mut audit_log(),
+        &[&comm_bad],
+        &[&bad],
+        &[&bl],
+        &[&point],
+        &[&e_bad],
+        &nb,
+        &lks,
+        pp,
+        &mut rand::thread_rng(),
+      )
+      .is_err(),
+      "a non-member value must be refused at prove time"
     );
   }
 
