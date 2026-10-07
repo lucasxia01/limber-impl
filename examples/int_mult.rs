@@ -129,7 +129,10 @@ fn main() {
     IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).expect("witness commit");
   let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).expect("prove");
   let commit_prove = t.elapsed();
-  println!("commit+prove:   {:9.1} ms", commit_prove.as_secs_f64() * 1e3);
+  println!(
+    "commit+prove:   {:9.1} ms",
+    commit_prove.as_secs_f64() * 1e3
+  );
   // Prover time as reported everywhere else in this repo and the paper:
   // witness generation plus commitment plus proving.
   println!(
